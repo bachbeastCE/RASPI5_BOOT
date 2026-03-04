@@ -1,31 +1,32 @@
 {
-    "configurations": [
-        {
-            "name": "Linux-Kernel-RPi5",
-            "includePath": [
-                "${workspaceFolder}/**",
-                "/home/Duybach/Documents/raspi5_boot/linux/include",
-                "/home/Duybach/Documents/raspi5_boot/linux/include/uapi",
-                "/home/Duybach/Documents/raspi5_boot/linux/include/generated", 
-                "/home/Duybach/Documents/raspi5_boot/linux/include/generated/uapi",
-                "/home/Duybach/Documents/raspi5_boot/linux/arch/arm64/include",
-                "/home/Duybach/Documents/raspi5_boot/linux/arch/arm64/include/uapi",
-                "/home/Duybach/Documents/raspi5_boot/linux/arch/arm64/include/generated",
-                "/home/Duybach/Documents/raspi5_boot/linux/arch/arm64/include/generated/uapi"
-            ],
-           "defines": [
-                "__KERNEL__",
-                "MODULE",
-                "__GNUC__=9",
-                "MODULE_LICENSE(x)=", 
-                "MODULE_AUTHOR(x)=",
-                "MODULE_DESCRIPTION(x)=",
-                "MODULE_INFO(x,y)="
-            ],
-            "cStandard": "c17",
-            "compilerPath": "/usr/bin/aarch64-linux-gnu-gcc",
-            "intelliSenseMode": "linux-gcc-arm64"
-        }
-    ],
-    "version": 4
+  "configurations": [
+    {
+      "name": "linux-gcc-arm64",
+      "includePath": [
+        "${workspaceFolder}/**",
+        "/home/Duybach/Documents/raspi5_boot/linux/include",
+        "/home/Duybach/Documents/raspi5_boot/linux/include/uapi",
+        "/home/Duybach/Documents/raspi5_boot/linux/include/generated",
+        "/home/Duybach/Documents/raspi5_boot/linux/include/generated/uapi",
+        "/home/Duybach/Documents/raspi5_boot/linux/arch/arm64/include",
+        "/home/Duybach/Documents/raspi5_boot/linux/arch/arm64/include/uapi",
+        "/home/Duybach/Documents/raspi5_boot/linux/arch/arm64/include/generated",
+        "/home/Duybach/Documents/raspi5_boot/linux/arch/arm64/include/generated/uapi"
+      ],
+      "defines": [
+        "__KERNEL__",
+        "MODULE",
+        "__GNUC__=9",
+        "MODULE_LICENSE(x)=",
+        "MODULE_AUTHOR(x)=",
+        "MODULE_DESCRIPTION(x)=",
+        "MODULE_INFO(x,y)="
+      ],
+      "cStandard": "c17",
+      "compilerPath": "/usr/bin/aarch64-linux-gnu-gcc",
+      "intelliSenseMode": "linux-gcc-arm64",
+      "cppStandard": "${default}"
+    }
+  ],
+  "version": 4
 }

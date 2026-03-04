@@ -1,6 +1,20 @@
 1. Thiết lập cấu hình mặc định (chọn bản phù hợp với kiến trúc chip bạn dùng, ví dụ cho Raspberry Pi 5 là ARM64): make ARCH=arm64 defconfig
+
 2. Tạo các file generated headers: make ARCH=arm64 modules_prepare
     + Lệnh modules_prepare sẽ tạo ra bounds.h và các file phụ thuộc khác mà driver của bạn đang cần để "hiểu" được cấu trúc của kernel hiện tại.
 
 3. Xóa các file rác do lần build lỗi trước đó: make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- distclean
-4. Tạo file cấu hình (config) cho ARM64: make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+
+4. Tạo file cấu hình (config) cho ARM64: 
+    make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig #Dùng cho hệ arm64
+    make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- bcm2712_defconfig #Dùng cho hệ rpi5
+
+5. Build kernel
+    + Biên dịch nhân (Kernel Image):
+        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- Image -j$(nproc)
+
+    + Biên dịch các Module (Cho driver BH1750 của bạn):
+        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules -j$(nproc)
+
+    + Biên dịch Device Tree (Quan trọng nhất để nhận diện phần cứng):
+        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- broadcom/bcm2712-rpi-5-b.dtb
