@@ -16,7 +16,6 @@
       "defines": [
         "__KERNEL__",
         "MODULE",
-        "__GNUC__=9",
         "MODULE_LICENSE(x)=",
         "MODULE_AUTHOR(x)=",
         "MODULE_DESCRIPTION(x)=",
