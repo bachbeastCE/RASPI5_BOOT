@@ -1,14 +1,18 @@
-# Ignore build artifacts
+# Chặn các file rác khi build nhân Linux và U-Boot
 *.o
 *.ko
-*.obj
-*.elf
-*.bin
-*.map
-*.d
+*.so
+*.mod
+*.mod.c
+*.symtypes
+*.order
+.tmp_versions/
+modules.order
+Module.symvers
+vmlinux
+System.map
 
-# Ignore Linux/U-Boot generated files
-linux/arch/*/boot/dts/*.dtb
-linux/arch/*/boot/dts/*.dtbo
-linux/vmlinux
-u-boot/u-boot*
+# Chặn các file build của U-Boot
+u-boot
+u-boot.bin
+u-boot.map

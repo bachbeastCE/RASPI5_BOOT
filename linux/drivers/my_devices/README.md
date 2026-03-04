@@ -1,0 +1,3 @@
+- This folder contains driver for custom device.
+- Some framework developing character device driver can be look at "!framework" folder
+- Some sub-folder can be contain a dump file folder which uses for storing testfile, documents, etc... This folder will be not compiled by using makefile 

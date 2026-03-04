@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# Makefile for my_devices drivers
+# 
+# drivers/my_devices/Kconfig
+
+menu "Custom Sensor Support"
+
+config MY_DEVICES
+    bool "Enable custom sensor drivers"
+    default y
+    help
+      Enable this to see the list of custom drivers developed for Raspi 5.
+
+if MY_DEVICES
+
+source "drivers/my_devices/bh1750/Kconfig"
+source "drivers/my_devices/d6t/Kconfig"
+source "drivers/my_devices/sx1278/Kconfig"
+
+endif # MY_DEVICES
+
+endmenu

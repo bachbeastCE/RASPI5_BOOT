@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# Sensor D6T driver configuration
+#
+
+config SENSOR_D6T
+    tristate "Omron D6T MEMS Thermal Sensor support"
+    default n
+    depends on I2C
+    help
+      Say Y here if you want to support the Omron D6T series non-contact
+      MEMS thermal sensors. These sensors use I2C to provide thermal
+      data (1x1, 1x8, or 4x4 pixels) for human detection or temperature
+      measurement.
+
+      To compile this driver as a module, choose M here: the
+      module will be called d6t.
