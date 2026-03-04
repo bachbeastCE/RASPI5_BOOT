@@ -1,0 +1,22 @@
+
+{
+    "configurations": [
+        {
+            "name": "Linux-Kernel-RPi5",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "/home/Duybach/Documents/raspi5_boot/linux/include",
+                "/home/Duybach/Documents/raspi5_boot/linux/arch/arm64/include",
+                "/home/Duybach/Documents/raspi5_boot/linux/include/uapi",
+                "/home/Duybach/Documents/raspi5_boot/linux/arch/arm64/include/generated"
+            ],
+            "defines": [
+                "__KERNEL__",
+                "MODULE"
+            ],
+            "compilerPath": "/usr/bin/aarch64-linux-gnu-gcc",
+            "intelliSenseMode": "linux-gcc-arm64"
+        }
+    ],
+    "version": 4
+}
