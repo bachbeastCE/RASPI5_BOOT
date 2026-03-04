@@ -1,3 +1,14 @@
-linux/
-u-boot/
-firmware/
+# Ignore build artifacts
+*.o
+*.ko
+*.obj
+*.elf
+*.bin
+*.map
+*.d
+
+# Ignore Linux/U-Boot generated files
+linux/arch/*/boot/dts/*.dtb
+linux/arch/*/boot/dts/*.dtbo
+linux/vmlinux
+u-boot/u-boot*
