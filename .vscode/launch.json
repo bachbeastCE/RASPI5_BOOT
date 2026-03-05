@@ -8,8 +8,8 @@
       "args": [],
       "stopAtEntry": false,
       "externalConsole": false,
-      "cwd": "/home/Duybach/Documents/raspi5_boot/linux/drivers/my_devices/!framework",
-      "program": "/home/Duybach/Documents/raspi5_boot/linux/drivers/my_devices/!framework/build/Debug/outDebug",
+      "cwd": "/home/Duybach/Documents/raspi5_boot/linux/drivers/my_devices/sx1278",
+      "program": "/home/Duybach/Documents/raspi5_boot/linux/drivers/my_devices/sx1278/build/Debug/outDebug",
       "MIMode": "gdb",
       "miDebuggerPath": "/usr/bin/aarch64-linux-gnu-gdb",
       "setupCommands": [

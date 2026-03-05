@@ -13,6 +13,5 @@ vmlinux
 System.map
 
 # Chặn các file build của U-Boot
-u-boot
 u-boot.bin
 u-boot.map

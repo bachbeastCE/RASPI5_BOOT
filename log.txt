@@ -1,4 +1,7 @@
 MM/DD/YYYY
+~ 5/3/2026
+    + Completed driver LoRa
+    + Add header makefile
 
 ~ 4/3/2026
     + Create Raspi5_Boot project, initilize environment, clone source
