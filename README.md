@@ -20,7 +20,7 @@ The **Raspberry Pi 5** introduces a more standard **ARM-style boot flow** compar
 |------|-----------|---------------|
 | **Stage 1** | SoC ROM | Executes immediately after power-on. Fetches the bootloader from the **on-board SPI EEPROM**. |
 | **Stage 2** | EEPROM Bootloader | Initializes **LPDDR4X RAM** and scans boot media such as **SD, NVMe, or USB** for the firmware partition. |
-| **Stage 3** | VideoCore Firmware | Executes `start_2712.elf`, loads configuration from `config.txt`, and prepares the **Device Tree**. |
+| **Stage 3** | VideoCore Firmware | Executes `bootcode.bin`, loads configuration from `config.txt`, and prepares the **Device Tree**. |
 | **Stage 4** | OS Loader | Transfers control to the **Linux Kernel (`kernel_2712.img`)** or a secondary bootloader such as **U-Boot**. |
 
 ---
