@@ -151,6 +151,8 @@ typedef struct LoRa_setting {
     uint16_t preamble;
     uint8_t  power;
     uint8_t  overCurrentProtection;
+
+
 } LoRa;
 
 static void LoRa_reset(LoRa *lora) {
@@ -520,45 +522,74 @@ uint8_t LoRa_receive(LoRa* _LoRa, uint8_t* data, uint8_t length){
 
 static long sx1278_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
     LoRa *lora = file->private_data;
-    struct lora_config conf;
     struct lora_packet pkt;
+    int val_int;
+    uint8_t val8;
+
+    if (!lora) return -EINVAL;
+
+    pr_info("%s: IOCTL called with cmd %u\n", DEVICE_NAME, cmd);
 
     switch (cmd) {
         case LORA_IOC_RESET:
-            /* Trigger the hardware reset sequence */
             LoRa_reset(lora);
             break;
-
-        case LORA_IOC_CONFIG:
-            /* Copy configuration from user-space */
-            if (copy_from_user(&conf, (struct lora_config __user *)arg, sizeof(conf)))
-                return -EFAULT;
             
-            /* Apply settings to SX1278 registers */
-            lora->frequency = conf.frequency;
-            // LoRa_init(lora); 
+        case LORA_IOC_SET_FREQ:
+            if (copy_from_user(&val_int, (int __user *)arg, sizeof(int)))
+                return -EFAULT;
+            LoRa_setFrequency(lora, val_int); 
             break;
 
+        case LORA_IOC_SET_SF:
+            if (copy_from_user(&val_int, (int __user *)arg, sizeof(int)))
+                return -EFAULT;
+            LoRa_setSpreadingFactor(lora, val_int);
+            break;
+
+        case LORA_IOC_SET_SYNC_WORD:
+            if (copy_from_user(&val8, (uint8_t __user *)arg, sizeof(uint8_t)))
+                return -EFAULT;
+            LoRa_setSyncWord(lora, val8);
+            break;
+
+        case LORA_IOC_SET_OCP:
+            if (copy_from_user(&val8, (uint8_t __user*)arg, sizeof(uint8_t)))
+                return -EFAULT;
+            LoRa_setOCP(lora, val8);
+        
+        case LORA_IOC_SET_POWER:
+            if (copy_from_user(&val8, (uint8_t __user*)arg, sizeof(uint8_t)))
+                return -EFAULT;
+            LoRa_setOCP(lora, val8);
+
         case LORA_IOC_TRANSMIT:
-            /* Copy data to be sent from user-space */
             if (copy_from_user(&pkt, (struct lora_packet __user *)arg, sizeof(pkt)))
                 return -EFAULT;
             
-            /* Send data via LoRa */
-            // LoRa_transmit(lora, pkt.payload, pkt.size);
+            if (pkt.size > 256) pkt.size = 256; 
+            
+            pr_info("%s: Transmitting %u bytes\n", DEVICE_NAME, pkt.size);
             break;
 
         case LORA_IOC_RECEIVE:
-            /* Get received data from driver buffer */
-            // pkt.size = LoRa_receive(lora, pkt.payload);
-            
-            /* Copy received data back to user-space */
             if (copy_to_user((struct lora_packet __user *)arg, &pkt, sizeof(pkt)))
                 return -EFAULT;
             break;
 
+        case LORA_IOC_GET_RSSI:
+            /* 1. Gọi hàm logic để lấy RSSI từ phần cứng */
+            int rssi_val = LoRa_getRSSI(lora); 
+            
+            /* 2. Gửi giá trị này về Userspace */
+            if (copy_to_user((int __user *)arg, &rssi_val, sizeof(int))) {
+                return -EFAULT;
+            }
+            pr_info("%s: RSSI requested, value: %d dBm\n", DEVICE_NAME, rssi_val);
+            break;
+
         default:
-            return -ENOTTY; /* Command not supported */
+            return -ENOTTY; /* Không hỗ trợ lệnh này */
     }
     return 0;
 }
@@ -575,10 +606,6 @@ static int sx1278_release(struct inode *inode, struct file *file){
     return 0;
 }
 
-static int sx1278_ioctl(struct inode *inode, struct file *file){
-    pr_info("%s: Device called IOCTL\n",DEVICE_NAME);
-    return 0;
-}
 
 static const struct file_operations sx1278_fops = {
     .owner = THIS_MODULE,
@@ -666,8 +693,6 @@ unregister_region:
 
 static void sx1278_remove(struct spi_device *spi) {
     LoRa *lora = spi_get_drvdata(spi);
-
-    
 
     if (!lora) return;
 
