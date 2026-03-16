@@ -597,6 +597,9 @@ static long sx1278_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 static int sx1278_open(struct inode *inode, struct file *file)
 {
+    LoRa *lora = file->private_data;
+    LoRa_init(lora);
+    
     pr_info("%s: Device opened\n",DEVICE_NAME);
     return 0;
 }
