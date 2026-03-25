@@ -11,7 +11,7 @@
 
 int main() {
     int fd;
-    int freq = 433000000; // 433 MHz
+    int freq = 433; // 433 MHz
     int sf = 7;           // Spreading Factor 7
     int rssi;
     uint8_t sync_word = 0x12;

@@ -14,7 +14,7 @@
 #define DEVICE_NAME "sx1278"
 #define CLASS_NAME  "sx1278_class"
 
-#define MAX_FIFO_SIZE 256
+#define MAX_FIFO_SIZE 255
  
 //--------- MODES ---------//
 #define SLEEP_MODE 0
@@ -135,7 +135,7 @@ typedef struct LoRa_setting {
     // Module settings:
     int      current_mode;
     uint32_t frequency;          
-    uint8_t  spredingFactor;
+    uint8_t  spreadingFactor;
     uint8_t  bandWidth;
     uint8_t  crcRate;
     uint16_t preamble;
@@ -173,56 +173,77 @@ static void LoRa_reset(LoRa *lora) {
     mdelay(10);
 }
 
-static uint8_t LoRa_isvalid(LoRa *lora) {
-    
-    /* 1. Frequency Validation: SX1278 supports 137MHz to 525MHz range */
-    if (lora->frequency < 137000000 || lora->frequency > 525000000) {
-        dev_err(&lora->spi->dev, "Invalid Frequency: %u Hz (Range: 137M-525M)\n", lora->frequency);
+static uint8_t LoRa_isvalid(LoRa *lora)
+{
+    /* 1. Frequency Validation (Numerical Range)
+     * Supporting 137MHz to 525MHz for SX1278. 
+     * Ensure frequency is in KHz (e.g., 433).
+     */
+    if (lora->frequency < 137 || lora->frequency > 525) {
+        dev_err(&lora->spi->dev, "Invalid Frequency: %u Hz\n", lora->frequency);
         return 0;
     }
 
-    /* 2. Spreading Factor (SF): LoRa supports SF6 to SF12 */
-    if (lora->spredingFactor < 6 || lora->spredingFactor > 12) {
-        dev_err(&lora->spi->dev, "Invalid SF: %u (Valid range: 6-12)\n", lora->spredingFactor);
-        return 0;
+    /* 2. Bandwidth Validation (Strict Macro Check) */
+    switch (lora->bandWidth) {
+        case BW_7_8KHz:  case BW_10_4KHz: case BW_15_6KHz:
+        case BW_20_8KHz: case BW_31_25KHz: case BW_41_7KHz:
+        case BW_62_5KHz: case BW_125KHz:  case BW_250KHz:
+        case BW_500KHz:
+            break; // Valid
+        default:
+            dev_err(&lora->spi->dev, "Invalid BW constant: %u\n", lora->bandWidth);
+            return 0;
     }
 
-    /* 3. Bandwidth (BW): Index must be 0-9 corresponding to 7.8kHz-500kHz */
-    if (lora->bandWidth > 9) {
-        dev_err(&lora->spi->dev, "Invalid BW Index: %u (Valid range: 0-9)\n", lora->bandWidth);
-        return 0;
+    /* 3. Coding Rate Validation (Strict Macro Check) */
+    switch (lora->crcRate) {
+        case CR_4_5: case CR_4_6: case CR_4_7: case CR_4_8:
+            break; // Valid
+        default:
+            dev_err(&lora->spi->dev, "Invalid CR constant: %u\n", lora->crcRate);
+            return 0;
     }
 
-    /* 4. Coding Rate (CR): Usually 1 (4/5) to 4 (4/8) */
-    if (lora->crcRate < 1 || lora->crcRate > 4) {
-        dev_err(&lora->spi->dev, "Invalid Coding Rate: %u (Valid range: 1-4)\n", lora->crcRate);
-        return 0;
+    /* 4. Spreading Factor Validation (Strict Macro Check) */
+    switch (lora->spreadingFactor) {
+        case SF_7: case SF_8: case SF_9:
+        case SF_10: case SF_11: case SF_12:
+            break; // Valid
+        default:
+            dev_err(&lora->spi->dev, "Invalid SF constant: %u\n", lora->spreadingFactor);
+            return 0;
     }
 
-    /* 5. Output Power: 2dBm to 20dBm (using PA_BOOST for higher power) */
-    if (lora->power < 2 || lora->power > 20) {
-        dev_err(&lora->spi->dev, "Invalid Power: %u dBm (Valid range: 2-20)\n", lora->power);
-        return 0;
+    /* 5. Power Gain Validation (Strict Macro Check) 
+     * Matching hex values: 0xF6, 0xF9, 0xFC, 0xFF
+     */
+    switch (lora->power) {
+        case POWER_11db: case POWER_14db: 
+        case POWER_17db: case POWER_20db:
+            break; // Valid
+        default:
+            dev_err(&lora->spi->dev, "Invalid Power Gain constant: 0x%02X\n", lora->power);
+            return 0;
     }
 
-    /* 6. Over Current Protection (OCP): Safety limit for current draw */
+    /* 6. OCP & Preamble (Numerical Range) */
     if (lora->overCurrentProtection < 45 || lora->overCurrentProtection > 240) {
-        dev_err(&lora->spi->dev, "Invalid OCP: %u mA (Valid range: 45-240)\n", lora->overCurrentProtection);
+        dev_err(&lora->spi->dev, "Invalid OCP: %u mA\n", lora->overCurrentProtection);
         return 0;
     }
 
-    /* 7. Preamble Length: Minimum 6 programmed symbols required */
     if (lora->preamble < 6) {
-        dev_err(&lora->spi->dev, "Preamble too short: %u (Min: 6)\n", lora->preamble);
+        dev_err(&lora->spi->dev, "Preamble too short: %u\n", lora->preamble);
         return 0;
     }
 
-    return 1; // All parameters are valid
+    return 1; // Success
 }
 
 static uint8_t LoRa_read(LoRa *lora, uint8_t addr)
 {
-    uint8_t tx = addr & 0x7F; // Bit 7 = 0 để đọc
+    uint8_t tx = addr & 0x7F; // Bit 7 = 0 d? d?c
     uint8_t rx = 0xFF;
     int ret;
     ret = spi_write_then_read(lora->spi, &tx, 1, &rx, 1);
@@ -238,7 +259,7 @@ static int LoRa_write(LoRa *lora, uint8_t addr, uint8_t val)
 {
     uint8_t tx[2];
 
-    tx[0] = addr | 0x80; // Bit 7 = 1 để ghi
+    tx[0] = addr | 0x80; // Bit 7 = 1 d? ghi
     tx[1] = val;
 
     // Ghi 2 byte: [Address | Data]
@@ -249,7 +270,7 @@ static int LoRa_burstWrite(LoRa *lora, uint8_t addr, uint8_t *buf, uint8_t len)
 {
     int ret;
 
-    // Kiểm tra giới hạn để không tràn buffer đã cấp phát trong struct LoRa
+    // Ki?m tra gi?i h?n d? không tràn buffer dã c?p phát trong struct LoRa
     if (len > MAX_FIFO_SIZE - 1) len = MAX_FIFO_SIZE - 1;
 
     lora->buffer[0] = addr | 0x80;
@@ -308,7 +329,7 @@ static void LoRa_gotoMode(LoRa* _LoRa, int mode){
 		    _LoRa->current_mode = CAD_MODE;
             break;
         default:
-            dev_warn(&_LoRa->spi->dev, "Chế độ không hợp lệ: %d\n", mode);
+            dev_warn(&_LoRa->spi->dev, "Ch? d? không h?p l?: %d\n", mode);
             return;
     }
 	LoRa_write(_LoRa, RegOpMode, data);
@@ -340,7 +361,7 @@ static void LoRa_setAutoLDO(LoRa* _LoRa){
         250000,  // 250 kHz
         500000   // 500 kHz
     };
-    uint32_t symbol = (1 << _LoRa->spredingFactor);
+    uint32_t symbol = (1 << _LoRa->spreadingFactor);
     // (2^SF / BW) > 16  <=>  2^SF > 16 * BW
     uint8_t ldo_on = symbol > (16 * BW[_LoRa->bandWidth]);
     LoRa_setLowDaraRateOptimization(_LoRa, ldo_on);
@@ -457,7 +478,7 @@ static uint16_t LoRa_init(LoRa* _LoRa){
 
 		// set spreading factor, CRC on, and Timeout Msb:
 			LoRa_setTOMsb_setCRCon(_LoRa);
-			LoRa_setSpreadingFactor(_LoRa, _LoRa->spredingFactor);
+			LoRa_setSpreadingFactor(_LoRa, _LoRa->spreadingFactor);
 
 		// set Timeout Lsb:
 			LoRa_write(_LoRa, RegSymbTimeoutLsb, 0xFF);
@@ -527,7 +548,7 @@ static void LoRa_startReceiving(LoRa* _LoRa){
     LoRa_gotoMode(_LoRa, RXCONTINUOUS_MODE);
 }
 
-static uint8_t LoRa_receive(LoRa* _LoRa, uint8_t* data, uint8_t length){
+static uint8_t LoRa_receive(LoRa* _LoRa, uint8_t* data, uint16_t length){
     uint8_t read;
 	uint8_t number_of_bytes;
 	uint8_t min = 0;
@@ -560,7 +581,7 @@ static long sx1278_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
     if (!lora) return -EINVAL;
 
-    // Lock để tránh xung đột SPI
+    // Lock d? tránh xung d?t SPI
     if (mutex_lock_interruptible(&lora->lock))
         return -ERESTARTSYS;
 
@@ -587,7 +608,7 @@ static long sx1278_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             if (copy_from_user(&val8, (uint8_t __user *)arg, sizeof(uint8_t))) {
                 ret = -EFAULT; goto out;
             }
-            LoRa_setPower(lora, val8); // Chú ý: Gọi đúng LoRa_setPower
+            LoRa_setPower(lora, val8); // Chú ý: G?i dúng LoRa_setPower
             break;
 
         case LORA_IOC_SET_OCP:
@@ -602,16 +623,16 @@ static long sx1278_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                 ret = -EFAULT; goto out;
             }
             
-            // SX1278 FIFO tối đa 256 bytes
+            // SX1278 FIFO t?i da 256 bytes
             if (pkt.size > 256) pkt.size = 256; 
             
-            // SỬA TẠI ĐÂY: pkt.payload thay vì pkt.buffer
+            // S?A T?I ÐÂY: pkt.payload thay vì pkt.buffer
             LoRa_transmit(lora, pkt.payload, (uint8_t)pkt.size, 1000);
             break;
 
         case LORA_IOC_RECEIVE:
-            // SỬA TẠI ĐÂY: pkt.payload thay vì pkt.buffer
-            // LoRa_receive trả về số byte thực tế nhận được
+            // S?A T?I ÐÂY: pkt.payload thay vì pkt.buffer
+            // LoRa_receive tr? v? s? byte th?c t? nh?n du?c
             pkt.size = LoRa_receive(lora, pkt.payload, 256);
             
             if (copy_to_user((struct lora_packet __user *)arg, &pkt, sizeof(pkt))) {
@@ -675,13 +696,13 @@ static int sx1278_probe(struct spi_device *spi)
     int ret;
     LoRa* lora;
 
-    // 1. Cấu hình SPI
+    // 1. C?u hình SPI
     spi->mode = SPI_MODE_0;
     spi->bits_per_word = 8;
     ret = spi_setup(spi);
     if (ret) return ret;
 
-    // 2. Cấp phát bộ nhớ cho cấu trúc dữ liệu chính
+    // 2. C?p phát b? nh? cho c?u trúc d? li?u chính
     lora = devm_kzalloc(&spi->dev, sizeof(*lora), GFP_KERNEL);
     if (!lora) return -ENOMEM;
 
@@ -692,23 +713,23 @@ static int sx1278_probe(struct spi_device *spi)
     lora->spi = spi;
     spi_set_drvdata(spi, lora);
 
-    // 3. Lấy chân Reset từ Device Tree
+    // 3. L?y chân Reset t? Device Tree
     lora->reset_pin = devm_gpiod_get(&spi->dev, "reset", GPIOD_OUT_LOW);
     if (IS_ERR(lora->reset_pin)) {
         return dev_err_probe(&spi->dev, PTR_ERR(lora->reset_pin), "Failed to get reset GPIO\n");
     }
 
-    // 4. Cấu hình mặc định (Dùng Hz cho tần số)
+    // 4. C?u hình m?c d?nh (Dùng Hz cho t?n s?)
     lora->frequency             = 433; // 433 MHz
-    lora->spredingFactor        = SF_7;
+    lora->spreadingFactor        = SF_7;
     lora->bandWidth             = BW_125KHz;
     lora->crcRate               = CR_4_5;
     lora->power                 = POWER_20db;
     lora->overCurrentProtection = 100;
     lora->preamble              = 8;
 
-    // 5. Đăng ký Character Device
-    // LƯU Ý: Truyền địa chỉ &lora->dev_num
+    // 5. Ðang ký Character Device
+    // LUU Ý: Truy?n d?a ch? &lora->dev_num
     ret = alloc_chrdev_region(&lora->dev_num, 0, 1, DEVICE_NAME);
     if (ret < 0) return ret;
 
@@ -717,7 +738,7 @@ static int sx1278_probe(struct spi_device *spi)
     ret = cdev_add(&lora->lora_cdev, lora->dev_num, 1);
     if (ret < 0) goto unregister_region;
 
-    // 6. Tạo Class và Device trong /dev
+    // 6. T?o Class và Device trong /dev
     lora->lora_class = class_create(CLASS_NAME);
     if (IS_ERR(lora->lora_class)) {
         ret = PTR_ERR(lora->lora_class);
@@ -733,7 +754,7 @@ static int sx1278_probe(struct spi_device *spi)
     dev_info(&spi->dev, "SX1278 LoRa driver probed successfully\n");
     return 0;
 
-// Thứ tự giải phóng ngược lại với thứ tự khởi tạo
+// Th? t? gi?i phóng ngu?c l?i v?i th? t? kh?i t?o
 destroy_class:
     class_destroy(lora->lora_class);
 del_cdev:
@@ -770,7 +791,7 @@ static void sx1278_remove(struct spi_device *spi) {
 
 // DRIVER DECLERATION
 static const struct of_device_id sx1278_dt_ids[] = {
-    { .compatible = "semtech,sx1278", }, // Nhớ khớp cái này với file .dts/.dtbo
+    { .compatible = "semtech,sx1278", }, // Nh? kh?p cái này v?i file .dts/.dtbo
     { }
 };
 MODULE_DEVICE_TABLE(of, sx1278_dt_ids);
@@ -783,12 +804,12 @@ MODULE_DEVICE_TABLE(spi, sx1278_id);
 
 static struct spi_driver sx1278_driver = {
     .driver = {
-        .name = "sx1278",               // Ngắn gọn, khớp với ID
+        .name = "sx1278",               // Ng?n g?n, kh?p v?i ID
         .of_match_table = sx1278_dt_ids,
     },
     .probe    = sx1278_probe,
     .remove   = sx1278_remove,
-    .id_table = sx1278_id,              // Đã gán đúng
+    .id_table = sx1278_id,              // Ðã gán dúng
 };
 
 module_spi_driver(sx1278_driver);
