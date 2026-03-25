@@ -176,9 +176,6 @@ uint16_t LoRa_init(LoRa* _LoRa);
 void LoRa_startReceiving(LoRa* _LoRa);
 
 
-
-
-
 static void LoRa_reset(LoRa *lora) {
     gpiod_set_value(lora->reset_pin, 1); 
     mdelay(10); 
@@ -757,6 +754,12 @@ static const struct of_device_id sx1278_dt_ids[] = {
     { }
 };
 
+static const struct spi_device_id sx1278_id[] = {
+    { "sx1278", 0 },
+    { }
+};
+MODULE_DEVICE_TABLE(spi, sx1278_id);
+
 MODULE_DEVICE_TABLE(of, sx1278_dt_ids);
 
 static struct spi_driver sx1278_driver = {
@@ -766,6 +769,7 @@ static struct spi_driver sx1278_driver = {
     },
     .probe = sx1278_probe,
     .remove = sx1278_remove,
+    .id_table = sx1278_id,
 };
 
 module_spi_driver(sx1278_driver);
