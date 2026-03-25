@@ -9,13 +9,14 @@
 #include <linux/init.h>
 #include <linux/fs.h>
 #include <linux/cdev.h>
+#include <linux/delay.h>
 #include "sx1278_ioctl.h"
 
 #define DEVICE_NAME "sx1278"
 #define CLASS_NAME  "sx1278_class"
 
 #define MAX_FIFO_SIZE 256
-
+ 
 //--------- MODES ---------//
 #define SLEEP_MODE 0
 #define STDBY_MODE 1
@@ -155,12 +156,35 @@ typedef struct LoRa_setting {
 
 } LoRa;
 
+static void LoRa_reset(LoRa *lora);
+static uint8_t LoRa_isvalid(struct LoRa_setting *lora);
+static uint8_t LoRa_read(LoRa *lora, uint8_t address);
+static void LoRa_write(struct LoRa_setting *_LoRa, uint8_t address, uint8_t value);
+static void LoRa_burstWrite(struct LoRa_setting *_LoRa, uint8_t address, uint8_t *value, uint8_t length);
+static void LoRa_burstRead(struct LoRa_setting *_LoRa, uint8_t address, uint8_t *value, uint8_t length);
+static void LoRa_gotoMode(LoRa* _LoRa, int mode);
+static void LoRa_setLowDaraRateOptimization(LoRa* _LoRa, uint8_t value);
+static void LoRa_setAutoLDO(LoRa* _LoRa);
+static void LoRa_setFrequency(LoRa* _LoRa, int freq);
+static void LoRa_setSpreadingFactor(LoRa* _LoRa, int SF);
+static void LoRa_setPower(LoRa* _LoRa, uint8_t power);
+static void LoRa_setOCP(LoRa* _LoRa, uint8_t ocp_current);
+static void LoRa_setTOMsb_setCRCon(LoRa* _LoRa);
+static void LoRa_setSyncWord(LoRa* _LoRa, uint8_t syncword);
+static int LoRa_getRSSI(LoRa* _LoRa);
+uint16_t LoRa_init(LoRa* _LoRa);
+void LoRa_startReceiving(LoRa* _LoRa);
+
+
+
+
+
 static void LoRa_reset(LoRa *lora) {
     gpiod_set_value(lora->reset_pin, 1); 
-    msleep(10); 
+    mdelay(10); 
 
     gpiod_set_value(lora->reset_pin, 0); 
-    msleep(10);
+    mdelay(10);
 }
 
 static uint8_t LoRa_isvalid(struct LoRa_setting *lora) {
@@ -296,7 +320,7 @@ static void LoRa_gotoMode(LoRa* _LoRa, int mode){
             return;
     }
 	LoRa_write(_LoRa, RegOpMode, data);
-    usleep(1000);
+    udelay(1000);
 	return;
 }
 
@@ -307,13 +331,27 @@ static void LoRa_setLowDaraRateOptimization(LoRa* _LoRa, uint8_t value){
 	if(value) data = read | 0x08;
 	else data = read & 0xF7;
 	LoRa_write(_LoRa, RegModemConfig3, data);
-    usleep(1000);
+    udelay(1000);
 	return;
 }
 
 static void LoRa_setAutoLDO(LoRa* _LoRa){
-    double BW[] = {7.8, 10.4, 15.6, 20.8, 31.25, 41.7, 62.5, 125.0, 250.0, 500.0};
-	LoRa_setLowDaraRateOptimization(_LoRa, (long)((1 << _LoRa->spredingFactor) / ((double)BW[_LoRa->bandWidth])) > 16.0);
+    uint32_t BW[] = {
+        7800,    // 7.8 kHz
+        10400,   // 10.4 kHz
+        15600,   // 15.6 kHz
+        20800,   // 20.8 kHz
+        31250,   // 31.25 kHz
+        41700,   // 41.7 kHz
+        62500,   // 62.5 kHz
+        125000,  // 125 kHz
+        250000,  // 250 kHz
+        500000   // 500 kHz
+    };
+    uint32_t symbol = (1 << _LoRa->spredingFactor);
+    // (2^SF / BW) > 16  <=>  2^SF > 16 * BW
+    uint8_t ldo_on = symbol > (16 * BW[_LoRa->bandWidth]);
+    LoRa_setLowDaraRateOptimization(_LoRa, ldo_on);
 }
 
 static void LoRa_setFrequency(LoRa* _LoRa, int freq){
@@ -324,17 +362,17 @@ static void LoRa_setFrequency(LoRa* _LoRa, int freq){
 	// write Msb:
 	data = F >> 16;
 	LoRa_write(_LoRa, RegFrMsb, data);
-	usleep(1000);
+	udelay(1000);
 
 	// write Mid:
 	data = F >> 8;
 	LoRa_write(_LoRa, RegFrMid, data);
-	usleep(1000);
+	udelay(1000);
 
 	// write Lsb:
 	data = F >> 0;
 	LoRa_write(_LoRa, RegFrLsb, data);
-	usleep(1000);
+	udelay(1000);
 }
 
 static void LoRa_setSpreadingFactor(LoRa* _LoRa, int SF){
@@ -347,18 +385,18 @@ static void LoRa_setSpreadingFactor(LoRa* _LoRa, int SF){
 		SF = 7;
 
 	read = LoRa_read(_LoRa, RegModemConfig2);
-	HAL_Delay(10);
+	udelay(10);
 
 	data = (SF << 4) + (read & 0x0F);
 	LoRa_write(_LoRa, RegModemConfig2, data);
-	HAL_Delay(10);
+	udelay(10);
 
 	LoRa_setAutoLDO(_LoRa);
 }
 
 static void LoRa_setPower(LoRa* _LoRa, uint8_t power){
     LoRa_write(_LoRa, RegPaConfig, power);
-    usleep(1000);
+    udelay(1000);
 }
 
 static void LoRa_setOCP(LoRa* _LoRa, uint8_t ocp_current){
@@ -374,7 +412,7 @@ static void LoRa_setOCP(LoRa* _LoRa, uint8_t ocp_current){
 
 	OcpTrim = OcpTrim + (1 << 5);
 	LoRa_write(_LoRa, RegOcp, OcpTrim);
-    usleep(1000);
+    udelay(1000);
 }
 
 static void LoRa_setTOMsb_setCRCon(LoRa* _LoRa){
@@ -382,18 +420,18 @@ static void LoRa_setTOMsb_setCRCon(LoRa* _LoRa){
 	read = LoRa_read(_LoRa, RegModemConfig2);
 	data = read | 0x07;
 	LoRa_write(_LoRa, RegModemConfig2, data);
-    usleep(1000);
+    udelay(1000);
 }
 
 static void LoRa_setSyncWord(LoRa* _LoRa, uint8_t syncword){
     LoRa_write(_LoRa, RegSyncWord, syncword);
-    usleep(1000);
+    udelay(1000);
 }
 
 static int LoRa_getRSSI(LoRa* _LoRa){
     uint8_t read;
 	read = LoRa_read(_LoRa, RegPktRssiValue);
-    usleep(1000);
+    udelay(1000);
 	return -164 + read;
 }
 
@@ -404,14 +442,14 @@ uint16_t LoRa_init(LoRa* _LoRa){
 	if(LoRa_isvalid(_LoRa)){
 		// goto sleep mode:
 			LoRa_gotoMode(_LoRa, SLEEP_MODE);
-			usleep(1000);
+			udelay(1000);
 
 		// turn on LoRa mode:
 			read = LoRa_read(_LoRa, RegOpMode);
-			usleep(1000);
+			udelay(1000);
 			data = read | 0x80;
 			LoRa_write(_LoRa, RegOpMode, data);
-			usleep(1000);
+			udelay(1000);
 
 		// set frequency:
 			LoRa_setFrequency(_LoRa, _LoRa->frequency);
@@ -452,7 +490,7 @@ uint16_t LoRa_init(LoRa* _LoRa){
 		// goto standby mode:
 			LoRa_gotoMode(_LoRa, STDBY_MODE);
 			_LoRa->current_mode = STDBY_MODE;
-			HAL_Delay(10);
+			udelay(10);
 
 			read = LoRa_read(_LoRa, RegVersion);
 			if(read == 0x12)
@@ -489,7 +527,7 @@ static uint8_t LoRa_transmit(LoRa* _LoRa, uint8_t* data, uint8_t length, uint16_
                 return 1;
             }
         }
-        usleep(1000);
+        udelay(1000);
     }
 }
 
@@ -618,7 +656,7 @@ static const struct file_operations sx1278_fops = {
 };
 
 
-static void sx1278_probe(struct spi_device *spi) 
+static int sx1278_probe(struct spi_device *spi) 
 {
     int ret;
     LoRa* lora;
