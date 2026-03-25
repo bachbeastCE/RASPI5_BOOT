@@ -161,8 +161,8 @@ static void LoRa_setOCP(LoRa* _LoRa, uint8_t ocp_current);
 static void LoRa_setTOMsb_setCRCon(LoRa* _LoRa);
 static void LoRa_setSyncWord(LoRa* _LoRa, uint8_t syncword);
 static int LoRa_getRSSI(LoRa* _LoRa);
-uint16_t LoRa_init(LoRa* _LoRa);
-void LoRa_startReceiving(LoRa* _LoRa);
+static uint16_t LoRa_init(LoRa* _LoRa);
+static void LoRa_startReceiving(LoRa* _LoRa);
 
 
 static void LoRa_reset(LoRa *lora) {
@@ -173,7 +173,7 @@ static void LoRa_reset(LoRa *lora) {
     mdelay(10);
 }
 
-static uint8_t LoRa_isvalid(struct LoRa_setting *lora) {
+static uint8_t LoRa_isvalid(LoRa *lora) {
     
     /* 1. Frequency Validation: SX1278 supports 137MHz to 525MHz range */
     if (lora->frequency < 137000000 || lora->frequency > 525000000) {
@@ -222,54 +222,46 @@ static uint8_t LoRa_isvalid(struct LoRa_setting *lora) {
 
 static uint8_t LoRa_read(LoRa *lora, uint8_t addr)
 {
-    uint8_t tx[2];
-    uint8_t rx[2];
+    uint8_t tx = addr & 0x7F; // Bit 7 = 0 để đọc
+    uint8_t rx = 0xFF;
     int ret;
-
-    tx[0] = addr & 0x7F; // read
-    tx[1] = 0x00;
-
-    ret = spi_write_then_read(lora->spi, tx, 2, rx, 2);
+    ret = spi_write_then_read(lora->spi, &tx, 1, &rx, 1);
     if (ret < 0) {
-        dev_err(&lora->spi->dev, "SPI read failed: %d\n", ret);
+        dev_err(&lora->spi->dev, "SPI read failed at 0x%02X: %d\n", addr, ret);
         return 0xFF;
     }
 
-    return rx[1];
+    return rx;
 }
 
 static int LoRa_write(LoRa *lora, uint8_t addr, uint8_t val)
 {
     uint8_t tx[2];
 
-    tx[0] = addr | 0x80; // write
+    tx[0] = addr | 0x80; // Bit 7 = 1 để ghi
     tx[1] = val;
 
+    // Ghi 2 byte: [Address | Data]
     return spi_write(lora->spi, tx, 2);
 }
 
 static int LoRa_burstWrite(LoRa *lora, uint8_t addr, uint8_t *buf, uint8_t len)
 {
-    uint8_t *tx;
     int ret;
 
-    tx = kmalloc(len + 1, GFP_KERNEL);
-    if (!tx)
-        return -ENOMEM;
+    // Kiểm tra giới hạn để không tràn buffer đã cấp phát trong struct LoRa
+    if (len > MAX_FIFO_SIZE - 1) len = MAX_FIFO_SIZE - 1;
 
-    tx[0] = addr | 0x80;
-    memcpy(&tx[1], buf, len);
+    lora->buffer[0] = addr | 0x80;
+    memcpy(&lora->buffer[1], buf, len);
 
-    ret = spi_write(lora->spi, tx, len + 1);
-    kfree(tx);
-
+    ret = spi_write(lora->spi, lora->buffer, len + 1);
     return ret;
 }
 
 static int LoRa_burstRead(LoRa *lora, uint8_t addr, uint8_t *buf, uint8_t len)
 {
     uint8_t tx = addr & 0x7F;
-
     return spi_write_then_read(lora->spi, &tx, 1, buf, len);
 }
 
@@ -435,7 +427,7 @@ static int LoRa_getRSSI(LoRa* _LoRa){
 	return -164 + read;
 }
 
-uint16_t LoRa_init(LoRa* _LoRa){
+static uint16_t LoRa_init(LoRa* _LoRa){
     uint8_t    data;
 	uint8_t    read;
 
@@ -503,7 +495,7 @@ uint16_t LoRa_init(LoRa* _LoRa){
 	}
 }
 
-static uint8_t LoRa_transmit(LoRa* _LoRa, uint8_t* data, uint8_t length, uint16_t timeout){
+static uint8_t LoRa_transmit(LoRa* _LoRa, uint8_t* data, uint16_t length, uint16_t timeout){
     uint8_t read;
 	int mode = _LoRa->current_mode;
 	LoRa_gotoMode(_LoRa, STDBY_MODE);
@@ -531,11 +523,11 @@ static uint8_t LoRa_transmit(LoRa* _LoRa, uint8_t* data, uint8_t length, uint16_
     }
 }
 
-void LoRa_startReceiving(LoRa* _LoRa){
+static void LoRa_startReceiving(LoRa* _LoRa){
     LoRa_gotoMode(_LoRa, RXCONTINUOUS_MODE);
 }
 
-uint8_t LoRa_receive(LoRa* _LoRa, uint8_t* data, uint8_t length){
+static uint8_t LoRa_receive(LoRa* _LoRa, uint8_t* data, uint8_t length){
     uint8_t read;
 	uint8_t number_of_bytes;
 	uint8_t min = 0;
@@ -558,100 +550,122 @@ uint8_t LoRa_receive(LoRa* _LoRa, uint8_t* data, uint8_t length){
     return min;
 }
 
+
 static long sx1278_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
     LoRa *lora = file->private_data;
     struct lora_packet pkt;
     int val_int;
     uint8_t val8;
+    int ret = 0;
 
     if (!lora) return -EINVAL;
 
-    pr_info("%s: IOCTL called with cmd %u\n", DEVICE_NAME, cmd);
+    // Lock để tránh xung đột SPI
+    if (mutex_lock_interruptible(&lora->lock))
+        return -ERESTARTSYS;
 
     switch (cmd) {
         case LORA_IOC_RESET:
             LoRa_reset(lora);
             break;
-            
+
         case LORA_IOC_SET_FREQ:
-            if (copy_from_user(&val_int, (int __user *)arg, sizeof(int)))
-                return -EFAULT;
-            LoRa_setFrequency(lora, val_int); 
+            if (copy_from_user(&val_int, (int __user *)arg, sizeof(int))) {
+                ret = -EFAULT; goto out;
+            }
+            LoRa_setFrequency(lora, val_int);
             break;
 
         case LORA_IOC_SET_SF:
-            if (copy_from_user(&val_int, (int __user *)arg, sizeof(int)))
-                return -EFAULT;
+            if (copy_from_user(&val_int, (int __user *)arg, sizeof(int))) {
+                ret = -EFAULT; goto out;
+            }
             LoRa_setSpreadingFactor(lora, val_int);
             break;
 
-        case LORA_IOC_SET_SYNC_WORD:
-            if (copy_from_user(&val8, (uint8_t __user *)arg, sizeof(uint8_t)))
-                return -EFAULT;
-            LoRa_setSyncWord(lora, val8);
+        case LORA_IOC_SET_POWER:
+            if (copy_from_user(&val8, (uint8_t __user *)arg, sizeof(uint8_t))) {
+                ret = -EFAULT; goto out;
+            }
+            LoRa_setPower(lora, val8); // Chú ý: Gọi đúng LoRa_setPower
             break;
 
         case LORA_IOC_SET_OCP:
-            if (copy_from_user(&val8, (uint8_t __user*)arg, sizeof(uint8_t)))
-                return -EFAULT;
+            if (copy_from_user(&val8, (uint8_t __user *)arg, sizeof(uint8_t))) {
+                ret = -EFAULT; goto out;
+            }
             LoRa_setOCP(lora, val8);
-        
-        case LORA_IOC_SET_POWER:
-            if (copy_from_user(&val8, (uint8_t __user*)arg, sizeof(uint8_t)))
-                return -EFAULT;
-            LoRa_setOCP(lora, val8);
+            break;
 
         case LORA_IOC_TRANSMIT:
-            if (copy_from_user(&pkt, (struct lora_packet __user *)arg, sizeof(pkt)))
-                return -EFAULT;
+            if (copy_from_user(&pkt, (struct lora_packet __user *)arg, sizeof(pkt))) {
+                ret = -EFAULT; goto out;
+            }
             
+            // SX1278 FIFO tối đa 256 bytes
             if (pkt.size > 256) pkt.size = 256; 
             
-            pr_info("%s: Transmitting %u bytes\n", DEVICE_NAME, pkt.size);
+            // SỬA TẠI ĐÂY: pkt.payload thay vì pkt.buffer
+            LoRa_transmit(lora, pkt.payload, (uint8_t)pkt.size, 1000);
             break;
 
         case LORA_IOC_RECEIVE:
-            if (copy_to_user((struct lora_packet __user *)arg, &pkt, sizeof(pkt)))
-                return -EFAULT;
+            // SỬA TẠI ĐÂY: pkt.payload thay vì pkt.buffer
+            // LoRa_receive trả về số byte thực tế nhận được
+            pkt.size = LoRa_receive(lora, pkt.payload, 256);
+            
+            if (copy_to_user((struct lora_packet __user *)arg, &pkt, sizeof(pkt))) {
+                ret = -EFAULT; goto out;
+            }
             break;
 
-        case LORA_IOC_GET_RSSI:
-            /* 1. Gọi hàm logic để lấy RSSI từ phần cứng */
-            int rssi_val = LoRa_getRSSI(lora); 
-            
-            /* 2. Gửi giá trị này về Userspace */
+        case LORA_IOC_GET_RSSI: {
+            int rssi_val = LoRa_getRSSI(lora);
             if (copy_to_user((int __user *)arg, &rssi_val, sizeof(int))) {
-                return -EFAULT;
+                ret = -EFAULT; goto out;
             }
-            pr_info("%s: RSSI requested, value: %d dBm\n", DEVICE_NAME, rssi_val);
             break;
+        }
 
         default:
-            return -ENOTTY; /* Không hỗ trợ lệnh này */
+            ret = -ENOTTY;
+            break;
     }
-    return 0;
-}
 
+out:
+    mutex_unlock(&lora->lock);
+    return ret;
+}
 
 static int sx1278_open(struct inode *inode, struct file *file)
 {
+    LoRa *lora = container_of(inode->i_cdev, LoRa, lora_cdev);
+    int ret;
+
+    file->private_data = lora;
+
+    ret = LoRa_init(lora);
+    if (ret != LORA_OK) {
+        dev_err(&lora->spi->dev, "Hardware initialization failed: %d\n", ret);
+        return -EIO;
+    }
+
+    dev_info(&lora->spi->dev, "Device opened successfully\n");
+    return 0;
+}
+
+static int sx1278_release(struct inode *inode, struct file *file)
+{
     LoRa *lora = file->private_data;
-    LoRa_init(lora);
-    
-    pr_info("%s: Device opened\n",DEVICE_NAME);
+    LoRa_gotoMode(lora, STDBY_MODE);
+    dev_info(&lora->spi->dev, "Device closed\n");
     return 0;
 }
-
-static int sx1278_release(struct inode *inode, struct file *file){
-    pr_info("%s: Device closed\n",DEVICE_NAME);
-    return 0;
-}
-
 
 static const struct file_operations sx1278_fops = {
-    .owner = THIS_MODULE,
-    .open = sx1278_open,
-    .release = sx1278_release,
+    .owner          = THIS_MODULE,
+    .open           = sx1278_open,
+    .release        = sx1278_release,
     .unlocked_ioctl = sx1278_ioctl,
 };
 
@@ -661,6 +675,13 @@ static int sx1278_probe(struct spi_device *spi)
     int ret;
     LoRa* lora;
 
+    // 1. Cấu hình SPI
+    spi->mode = SPI_MODE_0;
+    spi->bits_per_word = 8;
+    ret = spi_setup(spi);
+    if (ret) return ret;
+
+    // 2. Cấp phát bộ nhớ cho cấu trúc dữ liệu chính
     lora = devm_kzalloc(&spi->dev, sizeof(*lora), GFP_KERNEL);
     if (!lora) return -ENOMEM;
 
@@ -668,42 +689,35 @@ static int sx1278_probe(struct spi_device *spi)
     if (!lora->buffer) return -ENOMEM;
 
     mutex_init(&lora->lock);
-
-    spi_set_drvdata(spi, lora);
     lora->spi = spi;
+    spi_set_drvdata(spi, lora);
 
-    // Set RST and CS Pin:
+    // 3. Lấy chân Reset từ Device Tree
     lora->reset_pin = devm_gpiod_get(&spi->dev, "reset", GPIOD_OUT_LOW);
     if (IS_ERR(lora->reset_pin)) {
         return dev_err_probe(&spi->dev, PTR_ERR(lora->reset_pin), "Failed to get reset GPIO\n");
     }
 
-    // lora->cs_pin = devm_gpiod_get(&spi->dev, "manual-cs", GPIOD_OUT_HIGH);
-    // if (IS_ERR(lora->cs_pin)) {
-    //     return dev_err_probe(&spi->dev, PTR_ERR(lora->cs_pin), "Failed to get CS GPIO\n");
-    // }
+    // 4. Cấu hình mặc định (Dùng Hz cho tần số)
+    lora->frequency             = 433; // 433 MHz
+    lora->spredingFactor        = SF_7;
+    lora->bandWidth             = BW_125KHz;
+    lora->crcRate               = CR_4_5;
+    lora->power                 = POWER_20db;
+    lora->overCurrentProtection = 100;
+    lora->preamble              = 8;
 
-    //Default Configuration
-	lora->frequency             	= 433       		; //Defaut Fre 433(Asia)
-	lora->spredingFactor        	= SF_7      		; //Defaut 7kHZ
-	lora->bandWidth			   	    = BW_125KHz 		; //Defaut 125kHZ
-	lora->crcRate               	= CR_4_5    		; //Defaut 4/5
-	lora->power				   	    = POWER_20db        ; //Defaut max 20db
-	lora->overCurrentProtection 	= 100       		; //Defaut Imax 100 --> OcpTrim = 0x0b
-	lora->preamble			   	    = 8         		;
-
-    //Chardev registration
-    ret = alloc_chrdev_region(lora->dev_num, 0, 1, DEVICE_NAME);
-    if (ret < 0)
-        return ret;
+    // 5. Đăng ký Character Device
+    // LƯU Ý: Truyền địa chỉ &lora->dev_num
+    ret = alloc_chrdev_region(&lora->dev_num, 0, 1, DEVICE_NAME);
+    if (ret < 0) return ret;
 
     cdev_init(&lora->lora_cdev, &sx1278_fops);
     lora->lora_cdev.owner = THIS_MODULE;
-
     ret = cdev_add(&lora->lora_cdev, lora->dev_num, 1);
-    if (ret < 0)
-        goto unregister_region;
+    if (ret < 0) goto unregister_region;
 
+    // 6. Tạo Class và Device trong /dev
     lora->lora_class = class_create(CLASS_NAME);
     if (IS_ERR(lora->lora_class)) {
         ret = PTR_ERR(lora->lora_class);
@@ -719,8 +733,7 @@ static int sx1278_probe(struct spi_device *spi)
     dev_info(&spi->dev, "SX1278 LoRa driver probed successfully\n");
     return 0;
 
-destroy_device:
-    device_destroy(lora->lora_class, lora->dev_num);
+// Thứ tự giải phóng ngược lại với thứ tự khởi tạo
 destroy_class:
     class_destroy(lora->lora_class);
 del_cdev:
@@ -735,6 +748,10 @@ static void sx1278_remove(struct spi_device *spi) {
 
     if (!lora) return;
 
+    mutex_lock(&lora->lock);
+    LoRa_gotoMode(lora, SLEEP_MODE); 
+    mutex_unlock(&lora->lock);
+
     if (lora->lora_device) {
         device_destroy(lora->lora_class, lora->dev_num);
     }
@@ -746,14 +763,17 @@ static void sx1278_remove(struct spi_device *spi) {
     cdev_del(&lora->lora_cdev);
     unregister_chrdev_region(lora->dev_num, 1);
 
-    // Ghi log (Dùng &spi->dev để đúng chuẩn dev_info)
+    mutex_destroy(&lora->lock);
+
     dev_info(&spi->dev, "SX1278 LoRa driver removed successfully\n");
 }
 
+// DRIVER DECLERATION
 static const struct of_device_id sx1278_dt_ids[] = {
-    { .compatible = "semtech,sx1278", },
+    { .compatible = "semtech,sx1278", }, // Nhớ khớp cái này với file .dts/.dtbo
     { }
 };
+MODULE_DEVICE_TABLE(of, sx1278_dt_ids);
 
 static const struct spi_device_id sx1278_id[] = {
     { "sx1278", 0 },
@@ -761,16 +781,14 @@ static const struct spi_device_id sx1278_id[] = {
 };
 MODULE_DEVICE_TABLE(spi, sx1278_id);
 
-MODULE_DEVICE_TABLE(of, sx1278_dt_ids);
-
 static struct spi_driver sx1278_driver = {
     .driver = {
-        .name = "sx1278_lora",
+        .name = "sx1278",               // Ngắn gọn, khớp với ID
         .of_match_table = sx1278_dt_ids,
     },
-    .probe = sx1278_probe,
-    .remove = sx1278_remove,
-    .id_table = sx1278_id,
+    .probe    = sx1278_probe,
+    .remove   = sx1278_remove,
+    .id_table = sx1278_id,              // Đã gán đúng
 };
 
 module_spi_driver(sx1278_driver);
