@@ -5,7 +5,6 @@
 #include <linux/of_device.h>
 #include <linux/spinlock.h>
 #include <linux/spi/spi.h>
-#include <linux/regmap.h>
 #include <linux/init.h>
 #include <linux/fs.h>
 #include <linux/cdev.h>
@@ -117,20 +116,10 @@
 #define LORA_LARGE_PAYLOAD		413
 #define LORA_UNAVAILABLE		503
 
-
-static const struct regmap_config sx1278_regmap_config = {
-    .reg_bits = 8,              // Address register 8-bit
-    .val_bits = 8,              // Value register  8-bit
-    .write_flag_mask = 0x80,    // MSB = 1 when write reg
-    .max_register = 0x70,       // Max address of module
-    .cache_type = REGCACHE_NONE, // Turn of cache to read directly
-};
-
 typedef struct LoRa_setting {
     // Hardware settings 
     struct spi_device *spi;      
-    struct regmap     *regmap;   
-    struct gpio_desc  *cs_pin;    
+    //struct gpio_desc  *cs_pin;    
     struct gpio_desc  *reset_pin;
 
     // Character Device components
@@ -157,11 +146,11 @@ typedef struct LoRa_setting {
 } LoRa;
 
 static void LoRa_reset(LoRa *lora);
-static uint8_t LoRa_isvalid(struct LoRa_setting *lora);
+static uint8_t LoRa_isvalid(LoRa *lora);
 static uint8_t LoRa_read(LoRa *lora, uint8_t address);
-static void LoRa_write(struct LoRa_setting *_LoRa, uint8_t address, uint8_t value);
-static void LoRa_burstWrite(struct LoRa_setting *_LoRa, uint8_t address, uint8_t *value, uint8_t length);
-static void LoRa_burstRead(struct LoRa_setting *_LoRa, uint8_t address, uint8_t *value, uint8_t length);
+static int LoRa_write(LoRa *_LoRa, uint8_t address, uint8_t value);
+static int LoRa_burstWrite(LoRa *_LoRa, uint8_t address, uint8_t *value, uint8_t length);
+static int LoRa_burstRead(LoRa *_LoRa, uint8_t address, uint8_t *value, uint8_t length);
 static void LoRa_gotoMode(LoRa* _LoRa, int mode);
 static void LoRa_setLowDaraRateOptimization(LoRa* _LoRa, uint8_t value);
 static void LoRa_setAutoLDO(LoRa* _LoRa);
@@ -231,43 +220,57 @@ static uint8_t LoRa_isvalid(struct LoRa_setting *lora) {
     return 1; // All parameters are valid
 }
 
-static uint8_t LoRa_read(LoRa *lora, uint8_t address) {
-    unsigned int val; // Regmap require 32bits value to receive data
+static uint8_t LoRa_read(LoRa *lora, uint8_t addr)
+{
+    uint8_t tx[2];
+    uint8_t rx[2];
     int ret;
-    ret = regmap_read(lora->regmap, address, &val);
-    
+
+    tx[0] = addr & 0x7F; // read
+    tx[1] = 0x00;
+
+    ret = spi_write_then_read(lora->spi, tx, 2, rx, 2);
     if (ret < 0) {
-        dev_err(&lora->spi->dev, "Error reading register at 0x%02x: %d\n", address, ret);
+        dev_err(&lora->spi->dev, "SPI read failed: %d\n", ret);
         return 0xFF;
     }
-    return (uint8_t)val;
+
+    return rx[1];
 }
 
-static void LoRa_write(struct LoRa_setting *_LoRa, uint8_t address, uint8_t value) {
-    int ret = regmap_write(_LoRa->regmap, (unsigned int)address, (unsigned int)value);
-    if (ret < 0) {
-        dev_err(&_LoRa->spi->dev, "Error writing register at 0x%02x: %d\n", address, ret);
-        return;
-    }
-   return;
+static int LoRa_write(LoRa *lora, uint8_t addr, uint8_t val)
+{
+    uint8_t tx[2];
+
+    tx[0] = addr | 0x80; // write
+    tx[1] = val;
+
+    return spi_write(lora->spi, tx, 2);
 }
 
-static void LoRa_burstWrite(struct LoRa_setting *_LoRa, uint8_t address, uint8_t *value, uint8_t length) {
+static int LoRa_burstWrite(LoRa *lora, uint8_t addr, uint8_t *buf, uint8_t len)
+{
+    uint8_t *tx;
     int ret;
-    ret = regmap_bulk_write(_LoRa->regmap, (unsigned int)address, value, length);
-    if (ret < 0) {
-        dev_err(&_LoRa->spi->dev, "Burst write failed at 0x%02x, len %d: %d\n", address, length, ret);
-        return;
-    }
+
+    tx = kmalloc(len + 1, GFP_KERNEL);
+    if (!tx)
+        return -ENOMEM;
+
+    tx[0] = addr | 0x80;
+    memcpy(&tx[1], buf, len);
+
+    ret = spi_write(lora->spi, tx, len + 1);
+    kfree(tx);
+
+    return ret;
 }
 
-static void LoRa_burstRead(struct LoRa_setting *_LoRa, uint8_t address, uint8_t *value, uint8_t length) {
-    int ret;
-    ret = regmap_bulk_read(_LoRa->regmap, (unsigned int)address, value, length);
-    if (ret < 0) {
-        dev_err(&_LoRa->spi->dev, "Burst read failed at 0x%02x, len %d: %d\n", address, length, ret);
-        return;
-    }
+static int LoRa_burstRead(LoRa *lora, uint8_t addr, uint8_t *buf, uint8_t len)
+{
+    uint8_t tx = addr & 0x7F;
+
+    return spi_write_then_read(lora->spi, &tx, 1, buf, len);
 }
 
 static void LoRa_gotoMode(LoRa* _LoRa, int mode){
@@ -675,12 +678,10 @@ static int sx1278_probe(struct spi_device *spi)
         return dev_err_probe(&spi->dev, PTR_ERR(lora->reset_pin), "Failed to get reset GPIO\n");
     }
 
-    lora->cs_pin = devm_gpiod_get(&spi->dev, "manual-cs", GPIOD_OUT_HIGH);
-    if (IS_ERR(lora->cs_pin)) {
-        return dev_err_probe(&spi->dev, PTR_ERR(lora->cs_pin), "Failed to get CS GPIO\n");
-    }
-
-    lora->regmap = devm_regmap_init_spi(spi, &sx1278_regmap_config);
+    // lora->cs_pin = devm_gpiod_get(&spi->dev, "manual-cs", GPIOD_OUT_HIGH);
+    // if (IS_ERR(lora->cs_pin)) {
+    //     return dev_err_probe(&spi->dev, PTR_ERR(lora->cs_pin), "Failed to get CS GPIO\n");
+    // }
 
     //Default Configuration
 	lora->frequency             	= 433       		; //Defaut Fre 433(Asia)
