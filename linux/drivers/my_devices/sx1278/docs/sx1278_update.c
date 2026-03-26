@@ -444,72 +444,160 @@ static void LoRa_setSyncWord(LoRa* _LoRa, uint8_t syncword){
 
 static int LoRa_getRSSI(LoRa* _LoRa){
     uint8_t read;
-	read = LoRa_read(_LoRa, RegPktRssiValue);
+	read = LoRa_read(_LoRa, RegRssiValue);
 	return -164 + read;
 }
 
-static uint16_t LoRa_init(LoRa* _LoRa){
-    uint8_t    data;
-	uint8_t    read;
-
-	if(LoRa_isvalid(_LoRa)){
-		// goto sleep mode:
-			LoRa_gotoMode(_LoRa, SLEEP_MODE);
-
-		// turn on LoRa mode:
-			read = LoRa_read(_LoRa, RegOpMode);
-			data = read | 0x80;
-			LoRa_write(_LoRa, RegOpMode, data);
-
-		// set frequency:
-			LoRa_setFrequency(_LoRa, _LoRa->frequency);
-
-		// set output power gain:
-			LoRa_setPower(_LoRa, _LoRa->power);
-
-		// set over current protection:
-			LoRa_setOCP(_LoRa, _LoRa->overCurrentProtection);
-
-		// set LNA gain:
-			LoRa_write(_LoRa, RegLna, 0x23);
-
-		// set spreading factor, CRC on, and Timeout Msb:
-			LoRa_setTOMsb_setCRCon(_LoRa);
-			LoRa_setSpreadingFactor(_LoRa, _LoRa->spreadingFactor);
-
-		// set Timeout Lsb:
-			LoRa_write(_LoRa, RegSymbTimeoutLsb, 0xFF);
-
-		// set bandwidth, coding rate and expilicit mode:
-			// 8 bit RegModemConfig --> | X | X | X | X | X | X | X | X |
-			//       bits represent --> |   bandwidth   |     CR    |I/E|
-			data = 0;
-			data = (_LoRa->bandWidth << 4) + (_LoRa->crcRate << 1);
-			LoRa_write(_LoRa, RegModemConfig1, data);
-			LoRa_setAutoLDO(_LoRa);
-
-		// set preamble:
-            LoRa_write(_LoRa, RegPreambleMsb, _LoRa->preamble >> 8);
-            LoRa_write(_LoRa, RegPreambleLsb, _LoRa->preamble >> 0);
-
-        // DIO mapping: DIO0 -> RxDone (00)
-            read = LoRa_read(_LoRa, RegDioMapping1);
-            data = (read & 0x3F); // Ép DIO0 về 00 (RxDone)
-            LoRa_write(_LoRa, RegDioMapping1, data);
-            LoRa_write(_LoRa, RegIrqFlags, 0xFF);
-
-        // goto standby mode:
-            LoRa_gotoMode(_LoRa, STDBY_MODE);
-            _LoRa->current_mode = STDBY_MODE;
-
-        // Check Version cuối cùng
-            read = LoRa_read(_LoRa, RegVersion);
-            return (read == 0x12) ? LORA_OK : LORA_NOT_FOUND;
-	}
-	else {
-        return LORA_UNAVAILABLE;
-	}
+static void LoRa_enable_rx_crc(LoRa *lora) {
+    uint8_t config2;
+    config2 = LoRa_read(lora, RegModemConfig2);
+    config2 |= 0x04;
+    LoRa_write(lora, RegModemConfig2, config2);
 }
+
+
+static uint16_t LoRa_init(LoRa* _LoRa){
+    uint8_t data, read;
+    uint8_t v_freq_msb, v_freq_mid, v_freq_lsb;
+    uint16_t v_preamble;
+    uint8_t v_config1, v_config2, v_sync, v_dio;
+
+    if(LoRa_isvalid(_LoRa)){
+        // 1. Reset & Mode Setup
+        LoRa_gotoMode(_LoRa, SLEEP_MODE);
+        read = LoRa_read(_LoRa, RegOpMode);
+        LoRa_write(_LoRa, RegOpMode, read | 0x80); // Chế độ LoRa
+
+        // 2. Set các thông số chính
+        LoRa_setFrequency(_LoRa, _LoRa->frequency);
+        LoRa_setPower(_LoRa, _LoRa->power);
+        LoRa_setOCP(_LoRa, _LoRa->overCurrentProtection);
+        LoRa_write(_LoRa, RegLna, 0x23);
+
+        // 3. Modem Configuration (SF, CRC, Timeout, BW, CR)
+        LoRa_setTOMsb_setCRCon(_LoRa);
+        LoRa_setSpreadingFactor(_LoRa, _LoRa->spreadingFactor);
+        LoRa_write(_LoRa, RegSymbTimeoutLsb, 0xFF);
+
+        data = (_LoRa->bandWidth << 4) + (_LoRa->crcRate << 1);
+        LoRa_write(_LoRa, RegModemConfig1, data);
+        LoRa_setAutoLDO(_LoRa);
+
+        // 4. Preamble & Sync Word
+        LoRa_write(_LoRa, RegPreambleMsb, _LoRa->preamble >> 8);
+        LoRa_write(_LoRa, RegPreambleLsb, _LoRa->preamble & 0xFF);
+        LoRa_write(_LoRa, 0x39, 0xF1); // Force Sync Word 0xF1
+
+        // 5. DIO Mapping & Clean Up
+        read = LoRa_read(_LoRa, RegDioMapping1);
+        LoRa_write(_LoRa, RegDioMapping1, (read & 0x3F)); 
+        LoRa_write(_LoRa, RegIrqFlags, 0xFF);
+        LoRa_enable_rx_crc(_LoRa);
+
+        LoRa_gotoMode(_LoRa, STDBY_MODE);
+
+        // =========================================================
+        // PHẦN ĐỌC LẠI ĐỂ KIỂM TRA (VERIFICATION)
+        // =========================================================
+        dev_info(&_LoRa->spi->dev, "--- SX1278 REGISTER VERIFICATION ---\n");
+
+        // Đọc lại Frequency (RegFrMsb 0x06, Mid 0x07, Lsb 0x08)
+        v_freq_msb = LoRa_read(_LoRa, 0x06);
+        v_freq_mid = LoRa_read(_LoRa, 0x07);
+        v_freq_lsb = LoRa_read(_LoRa, 0x08);
+        dev_info(&_LoRa->spi->dev, "[CHECK] Freq Regs: 0x%02X 0x%02X 0x%02X\n", v_freq_msb, v_freq_mid, v_freq_lsb);
+
+        // Đọc lại Preamble (RegPreambleMsb 0x20, Lsb 0x21)
+        v_preamble = (LoRa_read(_LoRa, 0x20) << 8) | LoRa_read(_LoRa, 0x21);
+        dev_info(&_LoRa->spi->dev, "[CHECK] Preamble: %d (Target: %d)\n", v_preamble, _LoRa->preamble);
+
+        // Đọc lại Modem Config 1 & 2 (BW, CR, SF, CRC)
+        v_config1 = LoRa_read(_LoRa, 0x1D);
+        v_config2 = LoRa_read(_LoRa, 0x1E);
+        dev_info(&_LoRa->spi->dev, "[CHECK] Config1(0x1D): 0x%02X | Config2(0x1E): 0x%02X\n", v_config1, v_config2);
+
+        // Đọc lại Sync Word (0x39)
+        v_sync = LoRa_read(_LoRa, 0x39);
+        dev_info(&_LoRa->spi->dev, "[CHECK] Sync Word: 0x%02X (Target: 0xF1)\n", v_sync);
+
+        // Đọc lại DIO Mapping
+        v_dio = LoRa_read(_LoRa, RegDioMapping1);
+        dev_info(&_LoRa->spi->dev, "[CHECK] DIO0 Mapping: %s\n", (v_dio >> 6 == 0) ? "RxDone (OK)" : "WRONG");
+
+        // Cuối cùng check Version
+        read = LoRa_read(_LoRa, RegVersion);
+        dev_info(&_LoRa->spi->dev, "[CHECK] Silicon Version: 0x%02X\n", read);
+        dev_info(&_LoRa->spi->dev, "------------------------------------\n");
+
+        return (read == 0x12) ? LORA_OK : LORA_NOT_FOUND;
+    }
+    return LORA_UNAVAILABLE;
+}
+
+// static uint16_t LoRa_init(LoRa* _LoRa){
+//     uint8_t    data;
+// 	uint8_t    read;
+
+// 	if(LoRa_isvalid(_LoRa)){
+// 		// goto sleep mode:
+// 			LoRa_gotoMode(_LoRa, SLEEP_MODE);
+
+// 		// turn on LoRa mode:
+// 			read = LoRa_read(_LoRa, RegOpMode);
+// 			data = read | 0x80;
+// 			LoRa_write(_LoRa, RegOpMode, data);
+
+// 		// set frequency:
+// 			LoRa_setFrequency(_LoRa, _LoRa->frequency);
+
+// 		// set output power gain:
+// 			LoRa_setPower(_LoRa, _LoRa->power);
+
+// 		// set over current protection:
+// 			LoRa_setOCP(_LoRa, _LoRa->overCurrentProtection);
+
+// 		// set LNA gain:
+// 			LoRa_write(_LoRa, RegLna, 0x23);
+
+// 		// set spreading factor, CRC on, and Timeout Msb:
+// 			LoRa_setTOMsb_setCRCon(_LoRa);
+// 			LoRa_setSpreadingFactor(_LoRa, _LoRa->spreadingFactor);
+
+// 		// set Timeout Lsb:
+// 			LoRa_write(_LoRa, RegSymbTimeoutLsb, 0xFF);
+
+// 		// set bandwidth, coding rate and expilicit mode:
+// 			// 8 bit RegModemConfig --> | X | X | X | X | X | X | X | X |
+// 			//       bits represent --> |   bandwidth   |     CR    |I/E|
+// 			data = 0;
+// 			data = (_LoRa->bandWidth << 4) + (_LoRa->crcRate << 1);
+// 			LoRa_write(_LoRa, RegModemConfig1, data);
+// 			LoRa_setAutoLDO(_LoRa);
+
+// 		// set preamble:
+//             LoRa_write(_LoRa, RegPreambleMsb, _LoRa->preamble >> 8);
+//             LoRa_write(_LoRa, RegPreambleLsb, _LoRa->preamble >> 0);
+
+//         // DIO mapping: DIO0 -> RxDone (00)
+//             read = LoRa_read(_LoRa, RegDioMapping1);
+//             data = (read & 0x3F); // Ép DIO0 về 00 (RxDone)
+//             LoRa_write(_LoRa, RegDioMapping1, data);
+//             LoRa_write(_LoRa, RegIrqFlags, 0xFF);
+
+//             LoRa_enable_rx_crc(_LoRa);
+
+//         // goto standby mode:
+//             LoRa_gotoMode(_LoRa, STDBY_MODE);
+//             _LoRa->current_mode = STDBY_MODE;
+
+//         // Check Version cuối cùng
+//             read = LoRa_read(_LoRa, RegVersion);
+//             return (read == 0x12) ? LORA_OK : LORA_NOT_FOUND;
+// 	}
+// 	else {
+//         return LORA_UNAVAILABLE;
+// 	}
+// }
 
 static uint8_t LoRa_transmit(LoRa* _LoRa, uint8_t* data, uint16_t length, uint16_t timeout){
     uint8_t read;
@@ -559,56 +647,62 @@ static int LoRa_receive_continue(LoRa *lora, struct lora_packet *pkt)
     uint8_t irq_flags, num_bytes, fifo_addr;
     int i;
 
-    // 1. Đảm bảo chip đang ở chế độ nghe (RXCONTINUOUS)
-    // Dùng mutex để bảo vệ các lệnh SPI liên tiếp
+    // 1. Reset cờ phần mềm TRƯỚC khi ngủ để đảm bảo không bị thức giấc giả
+    lora->data_ready = false;
+
+    // 2. Kích hoạt chế độ nghe
     mutex_lock(&lora->lock);
     LoRa_gotoMode(lora, RXCONTINUOUS_MODE);
+    // Xóa sạch cờ cũ trên chip để DIO0 về mức Thấp (chuẩn bị cho cạnh lên mới)
+    LoRa_write(lora, RegIrqFlags, 0xFF); 
     mutex_unlock(&lora->lock);
 
-    if (wait_event_interruptible(lora->rx_wait, lora->data_ready)){
+    // 3. ĐI NGỦ (Wait for DIO0 Rising Edge)
+    if (wait_event_interruptible(lora->rx_wait, lora->data_ready)) {
+        // Nếu bị Ctrl+C thì đưa chip về Sleep cho tiết kiệm điện
         mutex_lock(&lora->lock);
         LoRa_gotoMode(lora, SLEEP_MODE);
         mutex_unlock(&lora->lock);
-        dev_info(&lora->spi->dev, "App interrupted by signal, LoRa put to sleep.\n");
-
         return -ERESTARTSYS;
     }
 
+    // 4. TỈNH DẬY: Xử lý dữ liệu
     mutex_lock(&lora->lock);
     
-    LoRa_gotoMode(lora, STDBY_MODE);
-    
+    // Đọc cờ ngắt TRƯỚC khi chuyển sang mode khác
     irq_flags = LoRa_read(lora, RegIrqFlags);
     
-    // Kiểm tra bit RxDone (0x40)
-    if (irq_flags & 0x40) {
-        // Xóa cờ ngắt trên chip (Ghi 1 để xóa)
-        LoRa_write(lora, RegIrqFlags, 0xFF);
-        
-        // Đọc số byte nhận được và giới hạn theo buffer
+    // Log để debug xem chip báo gì (RxDone=0x40, PayloadCrcError=0x20)
+    dev_info(&lora->spi->dev, "Wake up! IRQ Flags: 0x%02x\n", irq_flags);
+
+    if (irq_flags & 0x40) { // RxDone bit
+        // Kiểm tra lỗi CRC (Nếu bị nhiễu sóng)
+        if (irq_flags & 0x20) {
+            dev_warn(&lora->spi->dev, "CRC Error detected! Packet might be corrupted.\n");
+        }
+
         num_bytes = LoRa_read(lora, RegRxNbBytes);
         pkt->length = (num_bytes > 256) ? 256 : num_bytes;
         
-        // Cấu hình con trỏ FIFO tới địa chỉ gói tin vừa nhận
         fifo_addr = LoRa_read(lora, RegFiFoRxCurrentAddr);
         LoRa_write(lora, RegFiFoAddPtr, fifo_addr);
         
-        // Đọc tuần tự dữ liệu từ FIFO
         for (i = 0; i < pkt->length; i++) {
             pkt->data[i] = LoRa_read(lora, RegFiFo);
         }
+
+        // Xóa cờ ngắt ngay sau khi đọc xong để chân DIO0 hạ xuống mức Thấp
+        LoRa_write(lora, RegIrqFlags, 0xFF);
     } else {
-        // Trường hợp bị thức giấc giả (Spurious wakeup)
         pkt->length = 0;
+        dev_info(&lora->spi->dev, "Spurious wakeup: No RxDone flag found.\n");
     }
 
-    // 4. RESET TRẠNG THÁI: Hạ cờ phần mềm và đưa chip về lại mode RXCONTINUOUS
-    lora->data_ready = false;
-    LoRa_gotoMode(lora, RXCONTINUOUS_MODE);
-    
+    // Đưa về Standby để chuẩn bị cho chu kỳ ioctl tiếp theo
+    LoRa_gotoMode(lora, STDBY_MODE);
     mutex_unlock(&lora->lock);
 
-    return 0; // Thành công
+    return 0;
 }
 
 static long sx1278_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
