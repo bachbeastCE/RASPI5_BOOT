@@ -1,0 +1,52 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+    /* Khớp với compatible trong file gốc ông gửi */
+    compatible = "raspberrypi,5-model-b", "brcm,bcm2712";
+
+    fragment@0 {
+        /* Nhắm vào bus SPI0 của chip RP1 */
+        target = <&spi0>;
+        __overlay__ {
+            status = "okay";
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            /* Vô hiệu hóa spidev@0 mặc định để giải phóng CE0 */
+            spidev@0 {
+                status = "disabled";
+            };
+
+            /* Cấu hình SX1278 */
+            sx1278: sx1278@0 {
+                compatible = "semtech,sx1278";
+                reg = <0>; /* CE0 */
+                spi-max-frequency = <1000000>;
+                spi-bits-per-word = <8>;
+
+                /* Cấu hình Ngắt */
+                interrupt-parent = <&rp1_gpio>; /* Dùng nhãn gốc rp1_gpio cho chắc */
+                interrupts = <27 2>; /* IRQ_TYPE_EDGE_FALLING */
+
+                /* Cấu hình chân GPIO - Phải khớp tên trong code C của Bách */
+                reset-gpios = <&rp1_gpio 22 0>; /* GPIO_ACTIVE_HIGH */
+                dio0-gpios = <&rp1_gpio 27 0>;  /* GPIO_ACTIVE_HIGH */
+
+                status = "okay";
+            };
+        };
+    };
+
+    /* Thiết lập Pinctrl để đảm bảo chân không bị trôi (float) */
+    fragment@1 {
+        target = <&rp1_gpio>;
+        __overlay__ {
+            lora_pins: lora_pins {
+                brcm,pins = <27 22>;
+                brcm,function = <0 1>; /* 27: in (0), 22: out (1) */
+                brcm,pull = <0 2>;     /* 27 no pull, 13 Pull-up (2) để giữ 3.3V */
+            };
+        };
+    };
+};

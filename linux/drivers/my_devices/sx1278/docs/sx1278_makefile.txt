@@ -1,0 +1,11 @@
+obj-m += sx1278.o
+
+all sx1278.dtbo 
+    make -C /lib/modules/$(shell uname -r)/build/ M=$(PWD) module
+
+clean:
+    make -C /lib/modules/$(shell uname -r)/build/ M=$(PWD) clean
+    $(RM) sx1278.dtbo
+
+sx1278.dtbo: sx1278.dts
+    dtc -I dts -O dtb sx1278.dts -o sx1278.dtbo
