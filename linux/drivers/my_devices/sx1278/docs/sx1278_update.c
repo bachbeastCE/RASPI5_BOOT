@@ -9,6 +9,12 @@
 #include <linux/fs.h>
 #include <linux/cdev.h>
 #include <linux/delay.h>
+#include <linux/wait.h>   
+#include <linux/sched.h> 
+#include <linux/interrupt.h>
+#include <linux/gpio/consumer.h>
+
+
 #include "sx1278_ioctl.h"
 
 #define DEVICE_NAME "sx1278"
@@ -141,6 +147,11 @@ typedef struct LoRa_setting {
     uint16_t preamble;
     uint8_t  power;
     uint8_t  overCurrentProtection;
+
+    /* Cơ chế Blocking Read */
+    wait_queue_head_t rx_wait;    // Hàng đợi để App "đi ngủ"
+    bool data_ready;              // Cờ báo: True = Có hàng, False = Đang đợi
+    int irq;                      // Số hiệu ngắt hệ thống
 
 
 } LoRa;
@@ -478,23 +489,22 @@ static uint16_t LoRa_init(LoRa* _LoRa){
 			LoRa_setAutoLDO(_LoRa);
 
 		// set preamble:
-			LoRa_write(_LoRa, RegPreambleMsb, _LoRa->preamble >> 8);
-			LoRa_write(_LoRa, RegPreambleLsb, _LoRa->preamble >> 0);
+            LoRa_write(_LoRa, RegPreambleMsb, _LoRa->preamble >> 8);
+            LoRa_write(_LoRa, RegPreambleLsb, _LoRa->preamble >> 0);
 
-		// DIO mapping:   --> DIO: RxDone
-			read = LoRa_read(_LoRa, RegDioMapping1);
-			data = read | 0x3F;
-			LoRa_write(_LoRa, RegDioMapping1, data);
+        // DIO mapping: DIO0 -> RxDone (00)
+            read = LoRa_read(_LoRa, RegDioMapping1);
+            data = (read & 0x3F); // Ép DIO0 về 00 (RxDone)
+            LoRa_write(_LoRa, RegDioMapping1, data);
+            LoRa_write(_LoRa, RegIrqFlags, 0xFF);
 
-		// goto standby mode:
-			LoRa_gotoMode(_LoRa, STDBY_MODE);
-			_LoRa->current_mode = STDBY_MODE;
+        // goto standby mode:
+            LoRa_gotoMode(_LoRa, STDBY_MODE);
+            _LoRa->current_mode = STDBY_MODE;
 
-			read = LoRa_read(_LoRa, RegVersion);
-			if(read == 0x12)
-				return LORA_OK;
-			else
-				return LORA_NOT_FOUND;
+        // Check Version cuối cùng
+            read = LoRa_read(_LoRa, RegVersion);
+            return (read == 0x12) ? LORA_OK : LORA_NOT_FOUND;
 	}
 	else {
         return LORA_UNAVAILABLE;
@@ -528,33 +538,78 @@ static uint8_t LoRa_transmit(LoRa* _LoRa, uint8_t* data, uint16_t length, uint16
     }
 }
 
-static void LoRa_startReceiving(LoRa* _LoRa){
-    LoRa_gotoMode(_LoRa, RXCONTINUOUS_MODE);
+
+static irqreturn_t sx1278_irq_thread_fn(int irq, void *dev_id)
+{
+    LoRa *lora = dev_id;
+
+    // 1. Đánh dấu có dữ liệu mới
+    lora->data_ready = true;
+
+    // 2. Đánh thức App đang đợi ở wait_event_interruptible
+    wake_up_interruptible(&lora->rx_wait);
+    
+    dev_info(&lora->spi->dev, "Interrupt DIO0 triggered!\n");
+
+    return IRQ_HANDLED;
 }
 
-static uint8_t LoRa_receive(LoRa* _LoRa, uint8_t* data, uint16_t length){
-    uint8_t read;
-	uint8_t number_of_bytes;
-	uint8_t min = 0;
+static int LoRa_receive_continue(LoRa *lora, struct lora_packet *pkt)
+{
+    uint8_t irq_flags, num_bytes, fifo_addr;
+    int i;
 
-	for(int i=0; i<length; i++)
-		data[i]=0;
+    // 1. Đảm bảo chip đang ở chế độ nghe (RXCONTINUOUS)
+    // Dùng mutex để bảo vệ các lệnh SPI liên tiếp
+    mutex_lock(&lora->lock);
+    LoRa_gotoMode(lora, RXCONTINUOUS_MODE);
+    mutex_unlock(&lora->lock);
 
-	LoRa_gotoMode(_LoRa, STDBY_MODE);
-	read = LoRa_read(_LoRa, RegIrqFlags);
-	if((read & 0x40) != 0){
-		LoRa_write(_LoRa, RegIrqFlags, 0xFF);
-		number_of_bytes = LoRa_read(_LoRa, RegRxNbBytes);
-		read = LoRa_read(_LoRa, RegFiFoRxCurrentAddr);
-		LoRa_write(_LoRa, RegFiFoAddPtr, read);
-		min = length >= number_of_bytes ? number_of_bytes : length;
-		for(int i=0; i<min; i++)
-			data[i] = LoRa_read(_LoRa, RegFiFo);
-	}
-	LoRa_gotoMode(_LoRa, RXCONTINUOUS_MODE);
-    return min;
+    if (wait_event_interruptible(lora->rx_wait, lora->data_ready)){
+        mutex_lock(&lora->lock);
+        LoRa_gotoMode(lora, SLEEP_MODE);
+        mutex_unlock(&lora->lock);
+        dev_info(&lora->spi->dev, "App interrupted by signal, LoRa put to sleep.\n");
+
+        return -ERESTARTSYS;
+    }
+
+    mutex_lock(&lora->lock);
+    
+    LoRa_gotoMode(lora, STDBY_MODE);
+    
+    irq_flags = LoRa_read(lora, RegIrqFlags);
+    
+    // Kiểm tra bit RxDone (0x40)
+    if (irq_flags & 0x40) {
+        // Xóa cờ ngắt trên chip (Ghi 1 để xóa)
+        LoRa_write(lora, RegIrqFlags, 0xFF);
+        
+        // Đọc số byte nhận được và giới hạn theo buffer
+        num_bytes = LoRa_read(lora, RegRxNbBytes);
+        pkt->length = (num_bytes > 256) ? 256 : num_bytes;
+        
+        // Cấu hình con trỏ FIFO tới địa chỉ gói tin vừa nhận
+        fifo_addr = LoRa_read(lora, RegFiFoRxCurrentAddr);
+        LoRa_write(lora, RegFiFoAddPtr, fifo_addr);
+        
+        // Đọc tuần tự dữ liệu từ FIFO
+        for (i = 0; i < pkt->length; i++) {
+            pkt->data[i] = LoRa_read(lora, RegFiFo);
+        }
+    } else {
+        // Trường hợp bị thức giấc giả (Spurious wakeup)
+        pkt->length = 0;
+    }
+
+    // 4. RESET TRẠNG THÁI: Hạ cờ phần mềm và đưa chip về lại mode RXCONTINUOUS
+    lora->data_ready = false;
+    LoRa_gotoMode(lora, RXCONTINUOUS_MODE);
+    
+    mutex_unlock(&lora->lock);
+
+    return 0; // Thành công
 }
-
 
 static long sx1278_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
     LoRa *lora = file->private_data;
@@ -565,13 +620,13 @@ static long sx1278_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
     if (!lora) return -EINVAL;
 
-    // Lock d? tránh xung d?t SPI
     if (mutex_lock_interruptible(&lora->lock))
         return -ERESTARTSYS;
 
     switch (cmd) {
         case LORA_IOC_RESET:
             LoRa_reset(lora);
+            dev_info(&lora->spi->dev, "IOCTL: Hardware Reset performed\n");
             break;
 
         case LORA_IOC_SET_FREQ:
@@ -579,6 +634,7 @@ static long sx1278_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                 ret = -EFAULT; goto out;
             }
             LoRa_setFrequency(lora, val_int);
+            dev_info(&lora->spi->dev, "IOCTL: Frequency set to %d Hz\n", val_int);
             break;
 
         case LORA_IOC_SET_SF:
@@ -586,13 +642,15 @@ static long sx1278_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                 ret = -EFAULT; goto out;
             }
             LoRa_setSpreadingFactor(lora, val_int);
+            dev_info(&lora->spi->dev, "IOCTL: Spreading Factor set to %d\n", val_int);
             break;
 
         case LORA_IOC_SET_POWER:
             if (copy_from_user(&val8, (uint8_t __user *)arg, sizeof(uint8_t))) {
                 ret = -EFAULT; goto out;
             }
-            LoRa_setPower(lora, val8); // Chú ý: G?i dúng LoRa_setPower
+            LoRa_setPower(lora, val8);
+            dev_info(&lora->spi->dev, "IOCTL: Transmit Power set to %d dBm\n", val8);
             break;
 
         case LORA_IOC_SET_OCP:
@@ -600,28 +658,16 @@ static long sx1278_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                 ret = -EFAULT; goto out;
             }
             LoRa_setOCP(lora, val8);
+            dev_info(&lora->spi->dev, "IOCTL: Over Current Protection set to %d mA\n", val8);
             break;
 
         case LORA_IOC_TRANSMIT:
             if (copy_from_user(&pkt, (struct lora_packet __user *)arg, sizeof(pkt))) {
                 ret = -EFAULT; goto out;
             }
-            
-            // SX1278 FIFO t?i da 256 bytes
-            if (pkt.size > 256) pkt.size = 256; 
-            
-            // S?A T?I ÐÂY: pkt.payload thay vì pkt.buffer
-            LoRa_transmit(lora, pkt.payload, (uint8_t)pkt.size, 1000);
-            break;
-
-        case LORA_IOC_RECEIVE:
-            // S?A T?I ÐÂY: pkt.payload thay vì pkt.buffer
-            // LoRa_receive tr? v? s? byte th?c t? nh?n du?c
-            pkt.size = LoRa_receive(lora, pkt.payload, 256);
-            
-            if (copy_to_user((struct lora_packet __user *)arg, &pkt, sizeof(pkt))) {
-                ret = -EFAULT; goto out;
-            }
+            if (pkt.length > 256) pkt.length = 256; 
+            LoRa_transmit(lora, pkt.data, pkt.length, 1000);
+            dev_info(&lora->spi->dev, "IOCTL: Transmitted %d bytes\n", pkt.length);
             break;
 
         case LORA_IOC_GET_RSSI: {
@@ -629,10 +675,49 @@ static long sx1278_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             if (copy_to_user((int __user *)arg, &rssi_val, sizeof(int))) {
                 ret = -EFAULT; goto out;
             }
+            // Log này có thể hơi nhiễu nếu App gọi liên tục, nhưng để debug thì rất tốt
+            dev_info(&lora->spi->dev, "IOCTL: Current RSSI is %d dBm\n", rssi_val);
+            break;
+        }
+
+        case LORA_IOC_RECEIVE_CONTINUE: {
+            mutex_unlock(&lora->lock);
+            ret = LoRa_receive_continue(lora, &pkt);
+            
+            if (mutex_lock_interruptible(&lora->lock)) {
+                return -ERESTARTSYS; 
+            }
+
+            if (ret) {
+                // Chỉ log khi thực sự có lỗi hoặc bị ngắt, tránh spam log "Sleep" liên tục
+                if (ret != -ERESTARTSYS)
+                    dev_err(&lora->spi->dev, "IOCTL: Receive Continuous failed with error %d\n", ret);
+                goto out;
+            }
+
+            if (copy_to_user((struct lora_packet __user *)arg, &pkt, sizeof(struct lora_packet))) {
+                ret = -EFAULT;
+                goto out;
+            }
+            
+            dev_info(&lora->spi->dev, "IOCTL: Received packet, length: %d bytes\n", pkt.length);
+            break;
+        }
+
+        case LORA_IOC_SET_SYNC_WORD:{
+            // 1. Copy giá trị từ người dùng
+            if (copy_from_user(&val8, (uint8_t __user *)arg, sizeof(uint8_t))) {
+                ret = -EFAULT;
+                goto out;
+            }
+            LoRa_write(lora, RegSyncWord, val8); 
+            
+            dev_info(&lora->spi->dev, "IOCTL: Sync Word set to 0x%02X\n", val8);
             break;
         }
 
         default:
+            dev_warn(&lora->spi->dev, "IOCTL: Unknown command 0x%x\n", cmd);
             ret = -ENOTTY;
             break;
     }
@@ -648,12 +733,6 @@ static int sx1278_open(struct inode *inode, struct file *file)
     int ret;
 
     file->private_data = lora;
-
-    ret = LoRa_init(lora);
-    if (ret != LORA_OK) {
-        dev_err(&lora->spi->dev, "Hardware initialization failed: %d\n", ret);
-        return -EIO;
-    }
 
     dev_info(&lora->spi->dev, "Device opened successfully\n");
     return 0;
@@ -673,8 +752,6 @@ static const struct file_operations sx1278_fops = {
     .release        = sx1278_release,
     .unlocked_ioctl = sx1278_ioctl,
 };
-
-
 
 // DRIVER DECLERATION
 static int sx1278_probe(struct spi_device *spi) 
@@ -710,7 +787,44 @@ static int sx1278_probe(struct spi_device *spi)
         return dev_err_probe(&spi->dev, PTR_ERR(lora->dio0_pin), "Failed to get DIO0 GPIO\n");
     }
 
-    // 4. Reset c?ng module tru?c khi Init (Tùy ch?n nhung nên có)
+    lora->irq = gpiod_to_irq(lora->dio0_pin);
+    if (lora->irq < 0) {
+        dev_err(&spi->dev, "Failed to register IRQ: %d\n", ret);
+        return lora->irq;
+    }
+
+    // NULL: Không dùng Top-half (vì mình xử lý hết trong Thread-fn)
+    // IRQF_TRIGGER_RISING: Kích hoạt khi chân DIO0 nhảy từ 0 lên 1 (Rising Edge)
+    // IRQF_ONESHOT: Quan trọng! Kernel sẽ giữ ngắt này lại cho đến khi thread_fn chạy xong
+    // ret = devm_request_threaded_irq(&spi->dev, 
+    //                                 lora->irq, 
+    //                                 NULL, 
+    //                                 sx1278_irq_thread_fn, 
+    //                                 IRQF_TRIGGER_RISING | IRQF_ONESHOT, 
+    //                                 "sx1278_irq", 
+    //                                 lora);
+                                
+
+    ret = devm_request_threaded_irq(&spi->dev, 
+                                    lora->irq, 
+                                    NULL, 
+                                    sx1278_irq_thread_fn, 
+                                    IRQF_ONESHOT, // Không ép kiểu trigger ở đây nữa
+                                    "sx1278_irq", 
+                                    lora); 
+
+    if (ret) {
+        dev_err(&spi->dev, "Failed to register IRQ: %d\n", ret);
+        return ret;
+    }
+
+    // 3. Khởi tạo hàng đợi chờ
+    init_waitqueue_head(&lora->rx_wait);
+    lora->data_ready = false;
+
+    pr_info("sx1278: IRQ %d (GPIO 27) has successfully registered.!\n", lora->irq);
+
+    // 4. Reset cứng module truơc khi Init 
     gpiod_set_value(lora->reset_pin, 0);
     msleep(10);
     gpiod_set_value(lora->reset_pin, 1);
@@ -775,24 +889,26 @@ unregister_region:
 
 static void sx1278_remove(struct spi_device *spi) {
     LoRa *lora = spi_get_drvdata(spi);
-
     if (!lora) return;
 
+    // 1. Ðưa chip về Sleep (Cần lock SPI)
     mutex_lock(&lora->lock);
     LoRa_gotoMode(lora, SLEEP_MODE); 
     mutex_unlock(&lora->lock);
 
+    // 2. Hủy Device trước Class (Nguyên tắc: Con trước cha sau)
     if (lora->lora_device) {
         device_destroy(lora->lora_class, lora->dev_num);
     }
-
     if (!IS_ERR_OR_NULL(lora->lora_class)) {
         class_destroy(lora->lora_class);
     }
 
+    // 3. Hủy Character Device
     cdev_del(&lora->lora_cdev);
     unregister_chrdev_region(lora->dev_num, 1);
 
+    // 4. Hủy Mutex cuối cùng
     mutex_destroy(&lora->lock);
 
     dev_info(&spi->dev, "SX1278 LoRa driver removed successfully\n");
