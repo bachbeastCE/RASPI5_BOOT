@@ -1,0 +1,752 @@
+// Include
+#include <linux/module.h>
+#include <linux/timer.h>
+#include <linux/device.h>
+#include <linux/acpi.h>
+#include <linux/of_device.h>
+#include <linux/spinlock.h>
+#include <linux/spi/spi.h>
+#include <linux/init.h>
+#include <linux/fs.h>
+#include <linux/cdev.h>
+#include <linux/delay.h>
+#include <linux/wait.h>   
+#include <linux/sched.h> 
+#include <linux/interrupt.h>
+#include <linux/gpio/consumer.h>
+
+// Registers
+#define REG_FIFO                 0x00
+#define REG_OP_MODE              0x01
+#define REG_FRF_MSB              0x06
+#define REG_FRF_MID              0x07
+#define REG_FRF_LSB              0x08
+#define REG_PA_CONFIG            0x09
+#define REG_OCP                  0x0b
+#define REG_LNA                  0x0c
+#define REG_FIFO_ADDR_PTR        0x0d
+#define REG_FIFO_TX_BASE_ADDR    0x0e
+#define REG_FIFO_RX_BASE_ADDR    0x0f
+#define REG_FIFO_RX_CURRENT_ADDR 0x10
+#define REG_IRQ_FLAGS            0x12
+#define REG_RX_NB_BYTES          0x13
+#define REG_PKT_SNR_VALUE        0x19
+#define REG_PKT_RSSI_VALUE       0x1a
+#define REG_RSSI_VALUE           0x1b
+#define REG_MODEM_CONFIG_1       0x1d
+#define REG_MODEM_CONFIG_2       0x1e
+#define REG_PREAMBLE_MSB         0x20
+#define REG_PREAMBLE_LSB         0x21
+#define REG_PAYLOAD_LENGTH       0x22
+#define REG_MODEM_CONFIG_3       0x26
+#define REG_FREQ_ERROR_MSB       0x28
+#define REG_FREQ_ERROR_MID       0x29
+#define REG_FREQ_ERROR_LSB       0x2a
+#define REG_RSSI_WIDEBAND        0x2c
+#define REG_DETECTION_OPTIMIZE   0x31
+#define REG_INVERTIQ             0x33
+#define REG_DETECTION_THRESHOLD  0x37
+#define REG_SYNC_WORD            0x39
+#define REG_INVERTIQ2            0x3b
+#define REG_DIO_MAPPING_1        0x40
+#define REG_VERSION              0x42
+#define REG_PA_DAC               0x4d
+
+// Modes
+#define MODE_LONG_RANGE_MODE     0x80
+#define MODE_SLEEP               0x00
+#define MODE_STDBY               0x01
+#define MODE_TX                  0x03
+#define MODE_RX_CONTINUOUS       0x05
+#define MODE_RX_SINGLE           0x06
+
+// PA config
+#define PA_BOOST                 0x80
+
+// IRQ masks
+#define IRQ_TX_DONE_MASK           0x08
+#define IRQ_PAYLOAD_CRC_ERROR_MASK 0x20
+#define IRQ_RX_DONE_MASK           0x40
+
+#define RF_MID_BAND_THRESHOLD    525E6
+#define RSSI_OFFSET_HF_PORT      157
+#define RSSI_OFFSET_LF_PORT      164
+
+#define MAX_PKT_LENGTH           255
+
+// Addition
+#define PA_OUTPUT_RFO_PIN          0
+#define PA_OUTPUT_PA_BOOST_PIN     1
+
+// Device name
+#define DEVICE_NAME "sx1278"
+#define CLASS_NAME  "sx1278_class"
+
+
+//Macro
+#define bitWrite(value, bit, bitvalue) ((bitvalue) ? bitSet(value, bit) : bitClear(value, bit))
+
+
+
+// LoRa Controller Struct
+typedef struct LoRa{
+    // Hardware settings 
+    struct spi_device *spi;      
+    struct gpio_desc  *dio0_pin;    
+    struct gpio_desc  *reset_pin;
+
+    // Character Device components
+    dev_t dev_num;              // device order
+    struct cdev lora_cdev;      // char dev
+    struct class *lora_class;    
+    struct device *lora_device;
+    
+    //Buffer & synchronization
+    uint8_t *buffer;
+    uint16_t length;
+
+    struct mutex lock;
+
+    // Module settings:
+    int      current_mode;
+    uint32_t frequency;          
+    uint8_t  spreadingFactor;
+    uint8_t  bandWidth;
+    uint8_t  crcRate;
+    uint16_t preamble;
+    uint8_t  power;
+    uint8_t  overCurrentProtection;
+    int packetIndex;
+    int implicitHeaderMode;
+
+    void (*onReceive)(int);
+    void (*onTxDone)(void);
+
+    /* Cơ chế Blocking Read */
+    wait_queue_head_t rx_wait;    // Hàng đợi để App "đi ngủ"
+    bool data_ready;              // Cờ báo: True = Có hàng, False = Đang đợi
+    int irq;                      // Số hiệu ngắt hệ thống
+} LoRa_t;
+
+// Funtion predefine
+/* low-level */
+static uint8_t LoRa_readRegister(LoRa_t *lora, uint8_t address);
+static void LoRa_writeRegister(LoRa_t* lora, uint8_t address, uint8_t value);
+
+/* mode */
+static void LoRa_sleep(LoRa_t* lora);
+static void LoRa_idle(LoRa_t* lora);
+
+/* config */
+static void LoRa_setFrequency(LoRa_t *lora, uint32_t frequency);
+static void LoRa_setTxPower(LoRa_t *lora, int level, int outputPin);
+static void LoRa_setOCP(LoRa_t *lora, uint8_t mA);
+static void LoRa_setGain(LoRa_t *lora, uint8_t gain);
+static void LoRa_disableInvertIQ(LoRa_t *lora);
+static void LoRa_enableInvertIQ(LoRa_t *lora);
+static void LoRa_disableCrc(LoRa_t *lora);
+static void LoRa_enableCrc(LoRa_t *lora);
+static void LoRa_setSyncWord(LoRa_t *lora, int sw);
+static void LoRa_setPreambleLength(LoRa_t *lora, long length);
+static void LoRa_setCodingRate4(LoRa_t *lora, int denominator);
+static void LoRa_setLdoFlag(LoRa_t *lora);
+static void LoRa_setSignalBandwidth(LoRa_t *lora, long sbw);
+static void LoRa_setSpreadingFactor(LoRa_t *lora, int sf);
+
+
+
+
+/* get */
+static int LoRa_getSpreadingFactor(LoRa_t *lora);
+static long LoRa_getSignalBandwidth(LoRa_t *lora);
+static int LoRa_getSpreadingFactor(LoRa_t *lora);
+
+
+/* control */
+static bool LoRa_isTransmitting(LoRa_t *lora);
+static int LoRa_beginPacket(LoRa_t *lora, int implicitHeader);
+static void LoRa_handleDio0Rise(LoRa_t *lora);
+static void LoRa_onDio0Rise(LoRa_t *lora);
+static void LoRa_dumpRegisters(LoRa_t *lora);
+static uint8_t LoRa_random(LoRa_t *lora);
+
+
+/* driver */
+static irqreturn_t LoRa_irq_thread_fn(int irq, void *dev_id);
+static int LoRa_probe(struct spi_device *spi);
+
+
+
+
+
+//////////////////////////////////
+
+
+static uint8_t LoRa_readRegister(LoRa_t *lora, uint8_t address)
+{
+    uint8_t tx = address & 0x7F;
+    uint8_t rx;
+    spi_write_then_read(lora->spi, &tx, 1, &rx, 1);
+    return rx;
+}
+
+static void LoRa_writeRegister(LoRa_t *lora, uint8_t address, uint8_t value)
+{
+    uint8_t tx[2];
+    tx[0] = address | 0x80;
+    tx[1] = value;
+    spi_write(lora->spi, tx, 2); // ignore error
+}
+
+static void LoRa_sleep(LoRa_t* lora)
+{
+  LoRa_writeRegister(lora, REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_SLEEP);
+}
+
+static void LoRa_idle(LoRa_t* lora)
+{
+  LoRa_writeRegister(lora, REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_STDBY);
+}
+
+
+static void LoRa_setFrequency(LoRa_t *lora, uint32_t frequency)
+{
+    uint64_t frf;
+
+    lora->frequency = frequency;
+
+    frf = ((uint64_t)frequency << 19) / 32000000;
+    LoRa_writeRegister(lora, REG_FRF_MSB, (uint8_t)(frf >> 16));
+    LoRa_writeRegister(lora, REG_FRF_MID, (uint8_t)(frf >> 8));
+    LoRa_writeRegister(lora, REG_FRF_LSB, (uint8_t)(frf >> 0));
+}
+
+static void LoRa_setOCP(LoRa_t *lora, uint8_t mA)
+{
+  uint8_t ocpTrim = 27;
+
+  if (mA <= 120) {
+    ocpTrim = (mA - 45) / 5;
+  } else if (mA <=240) {
+    ocpTrim = (mA + 30) / 10;
+  }
+
+  LoRa_writeRegister(lora, REG_OCP, 0x20 | (0x1F & ocpTrim));
+}
+
+static void LoRa_setTxPower(LoRa_t *lora, int level, int outputPin)
+{
+  if (PA_OUTPUT_RFO_PIN == outputPin) {
+    // RFO
+    if (level < 0) {
+      level = 0;
+    } else if (level > 14) {
+      level = 14;
+    }
+
+    LoRa_writeRegister(lora, REG_PA_CONFIG, 0x70 | level);
+  } else {
+    // PA BOOST
+    if (level > 17) {
+      if (level > 20) {
+        level = 20;
+      }
+
+      // subtract 3 from level, so 18 - 20 maps to 15 - 17
+      level -= 3;
+
+      // High Power +20 dBm Operation (Semtech SX1276/77/78/79 5.4.3.)
+      LoRa_writeRegister(lora, REG_PA_DAC, 0x87);
+      setOCP(140);
+    } else {
+      if (level < 2) {
+        level = 2;
+      }
+      //Default value PA_HF/LF or +17dBm
+      LoRa_writeRegister(lora, REG_PA_DAC, 0x84);
+      setOCP(100);
+    }
+
+    writeRegister(REG_PA_CONFIG, PA_BOOST | (level - 2));
+  }
+}
+
+static void LoRa_setGain(LoRa_t *lora, uint8_t gain)
+{
+  // check allowed range
+  if (gain > 6) {
+    gain = 6;
+  }
+  
+  // set to standby
+  LoRa_idle(lora);
+  
+  // set gain
+  if (gain == 0) {
+    // if gain = 0, enable AGC
+    LoRa_writeRegister(lora, REG_MODEM_CONFIG_3, 0x04);
+  } else {
+    // disable AGC
+    LoRa_writeRegister(lora, REG_MODEM_CONFIG_3, 0x00);
+	
+    // clear Gain and set LNA boost
+    LoRa_writeRegister(lora, REG_LNA, 0x03);
+	
+    // set gain
+    LoRa_writeRegister(lora, REG_LNA, readRegister(REG_LNA) | (gain << 5));
+  }
+}
+
+
+
+
+
+
+static int LoRa_getSpreadingFactor(LoRa_t *lora)
+{
+  return readRegister(lora,REG_MODEM_CONFIG_2) >> 4;
+}
+
+static bool LoRa_isTransmitting(LoRa_t *lora)
+{
+  if ((LoRa_readRegister(lora, REG_OP_MODE) & MODE_TX) == MODE_TX) {
+    return true;
+  }
+
+  if (LoRa_readRegister(lora, REG_IRQ_FLAGS) & IRQ_TX_DONE_MASK) {
+    // clear IRQ's
+    LoRa_writeRegister(lora, REG_IRQ_FLAGS, IRQ_TX_DONE_MASK);
+  }
+
+  return false;
+}
+
+static void LoRa_explicitHeaderMode(LoRa_t *lora)
+{
+  lora->implicitHeaderMode = 0;
+
+  LoRa_writeRegister(lora, REG_MODEM_CONFIG_1, readRegister(REG_MODEM_CONFIG_1) & 0xfe);
+}
+
+static void LoRa_implicitHeaderMode(LoRa_t *lora)
+{
+  lora->implicitHeaderMode = 1;
+
+  LoRa_writeRegister(lora, REG_MODEM_CONFIG_1, readRegister(REG_MODEM_CONFIG_1) | 0x01);
+}
+
+static int LoRa_beginPacket(LoRa_t *lora, int implicitHeader)
+{
+  if (LoRa_isTransmitting(lora)) {
+    return 0;
+  }
+
+  // put in standby mode
+  LoRa_idle(lora);
+
+  if (implicitHeader) {
+    LoRa_implicitHeaderMode(lora);
+  } else {
+    LoRa_explicitHeaderMode(lora);
+  }
+
+  // reset FIFO address and paload length
+  LoRa_writeRegister(lora, REG_FIFO_ADDR_PTR, 0);
+  LoRa_writeRegister(lora, REG_PAYLOAD_LENGTH, 0);
+
+  return 1;
+}
+
+static void LoRa_handleDio0Rise(LoRa_t *lora)
+{
+  int irqFlags = LoRa_readRegister(lora, REG_IRQ_FLAGS);
+
+  // clear IRQ's
+  LoRa_writeRegister(lora, REG_IRQ_FLAGS, irqFlags);
+
+  if ((irqFlags & IRQ_PAYLOAD_CRC_ERROR_MASK) == 0) {
+
+    if ((irqFlags & IRQ_RX_DONE_MASK) != 0) {
+      // received a packet
+      lora->packetIndex = 0;
+
+      // read packet length
+      int packetLength = lora->implicitHeaderMode ? LoRa_readRegister(lora, REG_PAYLOAD_LENGTH) : LoRa_readRegister(lora, REG_RX_NB_BYTES);
+
+      // set FIFO address to current RX address
+      LoRa_writeRegister(lora, REG_FIFO_ADDR_PTR, readRegister(REG_FIFO_RX_CURRENT_ADDR));
+
+      if (lora->onReceive) {
+        lora->onReceive(packetLength);
+      }
+    }
+    else if ((irqFlags & IRQ_TX_DONE_MASK) != 0) {
+      if (lora->onTxDone) {
+        lora->onTxDone();
+      }
+    }
+  }
+}
+
+static void LoRa_onDio0Rise(LoRa_t *lora)
+{
+  LoRa_handleDio0Rise(lora);
+}
+
+static void LoRa_dumpRegisters(LoRa_t *lora)
+{
+    int i;
+    uint8_t val;
+
+    for (i = 0; i < 128; i++) {
+        val = LoRa_readRegister(lora, i);
+        dev_info(&lora->spi->dev, "Reg[0x%02X] = 0x%02X\n", i, val);
+    }
+}
+
+static uint8_t LoRa_random(LoRa_t *lora)
+{
+  return LoRa_readRegister(lora, REG_RSSI_WIDEBAND);
+}
+
+static void LoRa_disableInvertIQ(LoRa_t *lora)
+{
+  LoRa_writeRegister(lora, REG_INVERTIQ,  0x27);
+  LoRa_writeRegister(lora, REG_INVERTIQ2, 0x1d);
+}
+
+static void LoRa_enableInvertIQ(LoRa_t *lora)
+{
+  LoRa_writeRegister(lora, REG_INVERTIQ,  0x66);
+  LoRa_writeRegister(lora, REG_INVERTIQ2, 0x19);
+}
+
+static void LoRa_enableCrc(LoRa_t *lora)
+{
+  LoRa_writeRegister(lora, REG_MODEM_CONFIG_2, readRegister(REG_MODEM_CONFIG_2) | 0x04);
+}
+
+static void LoRa_disableCrc(LoRa_t *lora)
+{
+  LoRa_writeRegister(lora, REG_MODEM_CONFIG_2, readRegister(REG_MODEM_CONFIG_2) & 0xfb);
+}
+
+static void LoRa_setSyncWord(LoRa_t *lora, int sw)
+{
+  LoRa_writeRegister(lora, REG_SYNC_WORD, sw);
+}
+
+static void LoRa_setPreambleLength(LoRa_t *lora, long length)
+{
+  LoRa_writeRegister(lora, REG_PREAMBLE_MSB, (uint8_t)(length >> 8));
+  LoRa_writeRegister(lora, REG_PREAMBLE_LSB, (uint8_t)(length >> 0));
+}
+
+static void LoRa_setCodingRate4(LoRa_t *lora, int denominator)
+{
+  if (denominator < 5) {
+    denominator = 5;
+  } else if (denominator > 8) {
+    denominator = 8;
+  }
+
+  int cr = denominator - 4;
+
+  LoRa_writeRegister(lora, REG_MODEM_CONFIG_1, (readRegister(REG_MODEM_CONFIG_1) & 0xf1) | (cr << 1));
+}
+
+static void LoRa_setSignalBandwidth(LoRa_t *lora, long sbw)
+{
+    int bw;
+
+    if (sbw <= 7800) {
+        bw = 0;
+    } else if (sbw <= 10400) {
+        bw = 1;
+    } else if (sbw <= 15600) {
+        bw = 2;
+    } else if (sbw <= 20800) {
+        bw = 3;
+    } else if (sbw <= 31250) {
+        bw = 4;
+    } else if (sbw <= 41700) {
+        bw = 5;
+    } else if (sbw <= 62500) {
+        bw = 6;
+    } else if (sbw <= 125000) {
+        bw = 7;
+    } else if (sbw <= 250000) {
+        bw = 8;
+    } else {
+        bw = 9; // 500 kHz
+    }
+
+    LoRa_writeRegister(lora, REG_MODEM_CONFIG_1, (readRegister(REG_MODEM_CONFIG_1) & 0x0f) | (bw << 4));
+    LoRa_setLdoFlag(lora);
+}
+
+static void LoRa_setLdoFlag(LoRa_t *lora)
+{
+    // Section 4.1.1.5
+    long bw = LoRa_getSignalBandwidth(lora);
+    int sf = LoRa_getSpreadingFactor(lora);
+
+    // symbolDuration = (2^SF) / BW  (seconds)
+    // convert sang ms: *1000
+    // => symbolDuration_ms = (1000 * 2^SF) / BW
+
+    long symbolDuration = (1000L << sf) / bw;
+
+    // Section 4.1.1.6
+    bool ldoOn = symbolDuration > 16;
+
+    uint8_t config3 = LoRa_readRegister(lora, REG_MODEM_CONFIG_3);
+    bitWrite(config3, 3, ldoOn);
+    LoRa_writeRegister(lora, REG_MODEM_CONFIG_3, config3);
+}
+
+static long LoRa_getSignalBandwidth(LoRa_t *lora)
+{
+  uint8_t bw = (LoRa_readRegister(lora, REG_MODEM_CONFIG_1) >> 4);
+
+  switch (bw) {
+        case 0: return 7800;
+        case 1: return 10400;
+        case 2: return 15600;
+        case 3: return 20800;
+        case 4: return 31250;
+        case 5: return 41700;
+        case 6: return 62500;
+        case 7: return 125000;
+        case 8: return 250000;
+        case 9: return 500000;
+        default: return -1;
+    }
+
+  return -1;
+}
+
+static void LoRa_setSpreadingFactor(LoRa_t *lora, int sf)
+{
+  if (sf < 6) {
+    sf = 6;
+  } else if (sf > 12) {
+    sf = 12;
+  }
+
+  if (sf == 6) {
+    LoRa_writeRegister(lora, REG_DETECTION_OPTIMIZE, 0xc5);
+    LoRa_writeRegister(lora, REG_DETECTION_THRESHOLD, 0x0c);
+  } else {
+    LoRa_writeRegister(lora, REG_DETECTION_OPTIMIZE, 0xc3);
+    LoRa_writeRegister(lora, REG_DETECTION_THRESHOLD, 0x0a);
+  }
+
+  LoRa_writeRegister(lora, REG_MODEM_CONFIG_2, (readRegister(REG_MODEM_CONFIG_2) & 0x0f) | ((sf << 4) & 0xf0));
+  LoRa_setLdoFlag(lora);
+}
+
+static int LoRa_getSpreadingFactor(LoRa_t *lora)
+{
+  return LoRa_readRegister(lora, REG_MODEM_CONFIG_2) >> 4;
+}
+
+static void LoRa_receive(LoRa_t *lora, int size)
+{
+  LoRa_writeRegister(lora, REG_DIO_MAPPING_1, 0x00); // DIO0 => RXDONE
+
+  if (size > 0) {
+    LoRa_implicitHeaderMode(lora);
+
+    LoRa_writeRegister(lora, REG_PAYLOAD_LENGTH, size & 0xff);
+  } else {
+    LoRa_explicitHeaderMode(lora);
+  }
+
+  writeRegister(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_RX_CONTINUOUS);
+}
+
+static void LoRa_onTxDone(LoRa_t *lora, void (*callback)(void))
+{
+    // Linux không dùng callback kiểu này
+    // chỉ lưu lại nếu m muốn debug hoặc future use
+    lora->onTxDone = callback;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+static const struct file_operations sx1278_fops = {
+    .owner          = THIS_MODULE,
+    // .open           = sx1278_open,
+    // .release        = sx1278_release,
+    // .unlocked_ioctl = sx1278_ioctl,
+};
+
+static irqreturn_t LoRa_irq_thread_fn(int irq, void *dev_id)
+{
+    LoRa_t *lora = dev_id;
+
+    // 1. Đánh dấu có dữ liệu mới
+    lora->data_ready = true;
+
+    // 2. Đánh thức App đang đợi ở wait_event_interruptible
+    wake_up_interruptible(&lora->rx_wait);
+    
+    dev_info(&lora->spi->dev, "Interrupt DIO0 triggered!\n");
+
+    return IRQ_HANDLED;
+}
+
+static int LoRa_probe(struct spi_device *spi)
+{
+     int ret;
+    uint8_t version;
+    LoRa_t* lora;
+
+    // 1. SPI Config
+    spi->mode = SPI_MODE_0;
+    spi->bits_per_word = 8;
+    ret = spi_setup(spi);
+    if (ret) {
+        return dev_err_probe(&spi->dev, ret, "Setup SPI failed!\n");
+    }
+
+    lora = devm_kzalloc(&spi->dev, sizeof(*lora), GFP_KERNEL);
+    if (!lora) return -ENOMEM;
+
+    lora->spi = spi;
+    mutex_init(&lora->lock);
+    spi_set_drvdata(spi, lora);
+
+    // 3. Get Reset và Interrupt (DIO0) from Device Tree
+    lora->reset_pin = devm_gpiod_get(&spi->dev, "reset", GPIOD_OUT_HIGH); // Ð? High d? không b? reset liên t?c
+    if (IS_ERR(lora->reset_pin)) {
+        return dev_err_probe(&spi->dev, PTR_ERR(lora->reset_pin), "Failed to get reset GPIO\n");
+    }
+
+    lora->dio0_pin = devm_gpiod_get(&spi->dev, "dio0", GPIOD_IN); 
+    if (IS_ERR(lora->dio0_pin)) {
+        return dev_err_probe(&spi->dev, PTR_ERR(lora->dio0_pin), "Failed to get DIO0 GPIO\n");
+    }
+
+    lora->irq = gpiod_to_irq(lora->dio0_pin);
+    if (lora->irq < 0) {
+        dev_err(&spi->dev, "Failed to register IRQ: %d\n", ret);
+        return lora->irq;
+    }
+                               
+    ret = devm_request_threaded_irq(&spi->dev, 
+                                    lora->irq, 
+                                    NULL, 
+                                    LoRa_irq_thread_fn, 
+                                    IRQF_ONESHOT, 
+                                    "LoRa_irq", 
+                                    lora); 
+
+    if (ret) {
+        dev_err(&spi->dev, "Failed to register IRQ: %d\n", ret);
+        return ret;
+    }
+
+    // 3. Khởi tạo hàng đợi chờ
+    init_waitqueue_head(&lora->rx_wait);
+    lora->data_ready = false;
+
+    pr_info("sx1278: IRQ %d (GPIO 27) has successfully registered.!\n", lora->irq);
+
+    // 4. Reset cứng module truơc khi Init 
+    gpiod_set_value(lora->reset_pin, 0);
+    msleep(10);
+    gpiod_set_value(lora->reset_pin, 1);
+    msleep(10);
+
+    // 5. Ki?m tra(Version Check)
+    version = LoRa_read(lora, REG_VERSION);
+    if (version != 0x12) {
+        dev_err(&spi->dev, "Failed to detected SX1278  (Version: 0x%02x, mong d?i: 0x12)\n", version);
+        return -ENODEV;
+    }
+    dev_info(&spi->dev, "Detected SX1278 successfully, Version: 0x%02x\n", version);
+
+    // set base addresses
+        LoRa_writeRegister(lora, REG_FIFO_TX_BASE_ADDR, 0);
+        LoRa_writeRegister(lora, REG_FIFO_RX_BASE_ADDR, 0);
+
+    // set LNA boost
+        LoRa_writeRegister(lora, REG_LNA, readRegister(REG_LNA) | 0x03);
+
+    // set auto AGC
+        LoRa_writeRegister(lora, REG_MODEM_CONFIG_3, 0x04);
+
+    // set output power to 17 dBm
+        LoRa_setTxPower(lora, 17, 1);
+
+    // put in standby mode
+        LoRa_idle(lora);
+
+    // 7. Ðang ký Character Device
+    ret = alloc_chrdev_region(&lora->dev_num, 0, 1, DEVICE_NAME);
+    if (ret < 0) return ret;
+
+    cdev_init(&lora->lora_cdev, &sx1278_fops);
+    lora->lora_cdev.owner = THIS_MODULE;
+    ret = cdev_add(&lora->lora_cdev, lora->dev_num, 1);
+    if (ret < 0) goto unregister_region;
+
+    lora->lora_class = class_create(CLASS_NAME); 
+    if (IS_ERR(lora->lora_class)) {
+        ret = PTR_ERR(lora->lora_class);
+        goto del_cdev;
+    }
+
+    lora->lora_device = device_create(lora->lora_class, NULL, lora->dev_num, lora, DEVICE_NAME);
+    if (IS_ERR(lora->lora_device)) {
+        ret = PTR_ERR(lora->lora_device);
+        goto destroy_class;
+    }
+
+    dev_info(&spi->dev, "SX1278 LoRa driver probed successfully\n");
+
+    return 0;
+
+destroy_class:
+    class_destroy(lora->lora_class);
+del_cdev:
+    cdev_del(&lora->lora_cdev);
+unregister_region:
+    unregister_chrdev_region(lora->dev_num, 1);
+    return ret;
+}
+
+static void LoRa_remove(struct spi_device *spi) {
+    LoRa_t *lora = spi_get_drvdata(spi);
+    if (!lora) return;
+
+    LoRa_sleep(lora);
+
+    if (lora->lora_device) {
+        device_destroy(lora->lora_class, lora->dev_num);
+    }
+    if (!IS_ERR_OR_NULL(lora->lora_class)) {
+        class_destroy(lora->lora_class);
+    }
+
+    cdev_del(&lora->lora_cdev);
+    unregister_chrdev_region(lora->dev_num, 1);
+
+    mutex_destroy(&lora->lock);
+
+    dev_info(&spi->dev, "SX1278 LoRa driver removed successfully\n");
+}

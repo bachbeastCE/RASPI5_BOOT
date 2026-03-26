@@ -152,8 +152,6 @@ typedef struct LoRa_setting {
     wait_queue_head_t rx_wait;    // Hàng đợi để App "đi ngủ"
     bool data_ready;              // Cờ báo: True = Có hàng, False = Đang đợi
     int irq;                      // Số hiệu ngắt hệ thống
-
-
 } LoRa;
 
 static void LoRa_reset(LoRa *lora);
@@ -490,7 +488,7 @@ static uint16_t LoRa_init(LoRa* _LoRa){
 
         // 5. DIO Mapping & Clean Up
         read = LoRa_read(_LoRa, RegDioMapping1);
-        LoRa_write(_LoRa, RegDioMapping1, (read & 0x3F)); 
+        LoRa_write(_LoRa, RegDioMapping1, 0x00); 
         LoRa_write(_LoRa, RegIrqFlags, 0xFF);
         LoRa_enable_rx_crc(_LoRa);
 
@@ -699,7 +697,7 @@ static int LoRa_receive_continue(LoRa *lora, struct lora_packet *pkt)
     }
 
     // Đưa về Standby để chuẩn bị cho chu kỳ ioctl tiếp theo
-    LoRa_gotoMode(lora, STDBY_MODE);
+    LoRa_gotoMode(lora, RXCONTINUOUS_MODE);
     mutex_unlock(&lora->lock);
 
     return 0;
