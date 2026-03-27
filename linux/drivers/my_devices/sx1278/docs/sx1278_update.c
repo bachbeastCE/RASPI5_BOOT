@@ -636,7 +636,6 @@ static irqreturn_t sx1278_irq_thread_fn(int irq, void *dev_id)
     wake_up_interruptible(&lora->rx_wait);
     
     dev_info(&lora->spi->dev, "Interrupt DIO0 triggered!\n");
-
     return IRQ_HANDLED;
 }
 

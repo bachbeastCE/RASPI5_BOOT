@@ -131,6 +131,12 @@ typedef struct LoRa{
     int irq;                      // Số hiệu ngắt hệ thống
 } LoRa_t;
 
+typedef struct lora_packet {
+    uint8_t  data[256]; 
+    uint16_t length;           
+} LoRa_packet_t;
+
+
 // Funtion predefine
 /* low-level */
 static uint8_t LoRa_readRegister(LoRa_t *lora, uint8_t address);
@@ -648,10 +654,10 @@ static int LoRa_packetRssi(LoRa_t *lora)
   return (LoRa_readRegister(lora, REG_PKT_RSSI_VALUE) - (lora->frequency < RF_MID_BAND_THRESHOLD ? RSSI_OFFSET_LF_PORT : RSSI_OFFSET_HF_PORT));
 }
 
-static int LoRa_packetSnr_x4(LoRa_t *lora)
+static int LoRa_packetSnr(LoRa_t *lora)
 {
-    // giá trị SNR * 4
-    return (int8_t)LoRa_readRegister(lora, REG_PKT_SNR_VALUE);
+    // giá trị SNR
+    return (int8_t)(LoRa_readRegister(lora, REG_PKT_SNR_VALUE) / 4);
 }
 
 static long LoRa_packetFrequencyError(LoRa_t *lora)
@@ -691,7 +697,6 @@ static int LoRa_parsePacket(LoRa_t *lora, int size)
 
   if (size > 0) {
     LoRa_implicitHeaderMode(lora);
-
     LoRa_writeRegister(lora, REG_PAYLOAD_LENGTH, size & 0xff);
   } else {
     LoRa_explicitHeaderMode(lora);
@@ -762,11 +767,80 @@ static size_t LoRa_readBytes(LoRa_t *lora, uint8_t *buffer, size_t length)
     return count;
 }
 
+static int LoRa_receive_continue(LoRa_t *lora, LoRa_packet_t *pkt)
+{
+    uint8_t irq_flags, num_bytes, fifo_addr;
+    int i;
+
+    // 1. reset flag software
+    lora->data_ready = false;
+
+    // 2. clear IRQ trước khi vào RX (QUAN TRỌNG)
+    LoRa_writeRegister(lora, REG_IRQ_FLAGS, 0xFF);
+
+    // 3. set RX mode
+    LoRa_receive(lora,0);
+    // 4. wait interrupt
+    if (wait_event_interruptible(lora->rx_wait, lora->data_ready)) {
+        return -ERESTARTSYS;
+    }
+
+    // 5.đọc IRQ NGAY khi wakeup
+    irq_flags = LoRa_readRegister(lora, REG_IRQ_FLAGS);
+
+    dev_info(&lora->spi->dev, "IRQ=0x%02X\n", irq_flags);
+
+    // 6. check RX_DONE
+    if (irq_flags & 0x40)
+    {
+        // check CRC
+        if (irq_flags & 0x20) {
+            dev_warn(&lora->spi->dev, "CRC ERROR\n");
+            pkt->length = 0;
+            goto out;
+        }
+
+        // 7. đọc payload
+        num_bytes = LoRa_readRegister(lora, REG_RX_NB_BYTES);
+        pkt->length = (num_bytes > 256) ? 256 : num_bytes;
+
+        fifo_addr = LoRa_readRegister(lora, REG_FIFO_RX_CURRENT_ADDR);
+        LoRa_writeRegister(lora, REG_FIFO_ADDR_PTR, fifo_addr);
+
+        for (i = 0; i < pkt->length; i++) {
+            pkt->data[i] = LoRa_readRegister(lora, REG_FIFO);
+        }
+
+        // debug RSSI/SNR nếu cần
+        int rssi = LoRa_packetRssi(lora);
+        int snr  = LoRa_packetSnr(lora);
+
+        dev_info(&lora->spi->dev,
+                 "[RX] len=%d RSSI=%d SNR=%d\n",
+                 pkt->length, rssi, snr);
+    }
+    else
+    {
+        pkt->length = 0;
+        dev_warn(&lora->spi->dev, "Spurious IRQ\n");
+    }
+
+out:
+    // 8. clear IRQ & set RX_CONTIMODE
+    LoRa_writeRegister(lora, REG_IRQ_FLAGS, 0xFF);
+    LoRa_receive(lora,0);
+
+    return 0;
+}
+
+
 static ssize_t LoRa_read_file(struct file *file, char __user *buf, size_t len, loff_t *offset)
 {
   int rssi;
   int snr ;
   LoRa_t *lora = file->private_data;
+
+  LoRa_receive(lora,0);
 
   uint8_t mode = LoRa_readRegister(lora, REG_OP_MODE);
   dev_info(&lora->spi->dev, "MODE=0x%02X\n", mode);
@@ -780,27 +854,34 @@ static ssize_t LoRa_read_file(struct file *file, char __user *buf, size_t len, l
 
     if (packetSize > 0) {
         rssi = LoRa_packetRssi(lora);
-        snr  = LoRa_packetSnr_x4(lora);
+        snr  = LoRa_packetSnr(lora);
     }
 
     dev_info(&lora->spi->dev,
               "[LORA] RX: size=%d RSSI=%d SNR=%d\n",
               packetSize,
               rssi,
-              snr / 4);
-
-    LoRa_receive(lora,0);
-
-    uint64_t frf =
-    ((uint64_t)LoRa_readRegister(lora, REG_FRF_MSB) << 16) |
-    ((uint64_t)LoRa_readRegister(lora, REG_FRF_MID) << 8)  |
-    ((uint64_t)LoRa_readRegister(lora, REG_FRF_LSB));
-
-    dev_info(&lora->spi->dev, "FRF=0x%llX\n", frf);
-
+              snr);
     return packetSize;
 
 }
+
+static ssize_t LoRa_read_file_continue(struct file *file, char __user *buf, size_t len, loff_t *offset)
+{
+    struct lora_packet pkt;
+    LoRa_t *lora = file->private_data;
+
+    // gọi hàm blocking chờ interrupt
+    LoRa_receive_continue(lora, &pkt);
+
+    // copy data ra user
+    copy_to_user(buf, pkt.data, pkt.length);
+
+    print_hex_dump(KERN_INFO, "LoRa RX Payload: ", DUMP_PREFIX_OFFSET, 16, 1, pkt.data, pkt.length, true);
+
+    return pkt.length;
+}
+
 
 static int LoRa_open_file(struct inode *inode, struct file *file)
 {
@@ -815,13 +896,26 @@ static int LoRa_open_file(struct inode *inode, struct file *file)
     return 0;
 }
 
+static int LoRa_release_file(struct inode *inode, struct file *file)
+{
+    LoRa_t *lora = container_of(inode->i_cdev, LoRa_t, lora_cdev);
+    int ret;
+
+    file->private_data = lora;
+
+    LoRa_sleep(lora);
+
+    dev_info(&lora->spi->dev, "Device close successfully\n");
+    return 0;
+}
+
 
 static const struct file_operations sx1278_fops = {
     .owner          = THIS_MODULE,
     .open           = LoRa_open_file,
-    // .release        = sx1278_release,
+    .release        = LoRa_release_file,
     // .unlocked_ioctl = sx1278_ioctl,
-    .read = LoRa_read_file,
+    .read = LoRa_read_file_continue,
 };
 
 static irqreturn_t LoRa_irq_thread_fn(int irq, void *dev_id)
@@ -914,7 +1008,7 @@ static int LoRa_probe(struct spi_device *spi)
     LoRa_sleep(lora);
 
     // set frequency
-    LoRa_setFrequency(lora, 433000000);
+    LoRa_setFrequency(lora, 434000000);
 
     // set base addresses
         LoRa_writeRegister(lora, REG_FIFO_TX_BASE_ADDR, 0);
